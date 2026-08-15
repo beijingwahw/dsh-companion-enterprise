@@ -46,14 +46,15 @@
 ### 前置要求
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) `>= 0.1.0`
 - Node.js `>= 18`
+- pnpm（`npm install -g pnpm`）
 
 ### 从源码安装
 
 ```bash
 git clone https://github.com/beijingwahw/dsh-companion-enterprise.git
 cd dsh-companion-enterprise
-npm install
-npm run build
+pnpm install
+pnpm run build
 
 # 注册到 Harness（web profile）
 dsh plugin --profile web add $(pwd)
