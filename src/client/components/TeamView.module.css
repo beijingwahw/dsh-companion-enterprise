@@ -1,0 +1,249 @@
+/* 协作与知识管理视图样式（CSS Modules + --dsw-alias-* 语义令牌）。 */
+
+.root {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  color: var(--dsw-alias-fg-primary, #1f2328);
+}
+
+.title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--dsw-alias-border-primary, #d0d7de);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.section h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.subTitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.formGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+.table th,
+.table td {
+  border: 1px solid var(--dsw-alias-border-primary, #d0d7de);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.table th {
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+}
+
+.cellCode {
+  max-width: 260px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.empty {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.errorText {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-danger, #cf222e);
+}
+
+.rowActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.pillSuccess {
+  background: var(--dsw-alias-bg-success-subtle, #dafbe1);
+  color: var(--dsw-alias-fg-success, #1a7f37);
+}
+
+.pillDanger {
+  background: var(--dsw-alias-bg-danger-subtle, #ffebe9);
+  color: var(--dsw-alias-fg-danger, #cf222e);
+}
+
+.pillWarning {
+  background: var(--dsw-alias-bg-warning-subtle, #fff8c5);
+  color: var(--dsw-alias-fg-warning, #9a6700);
+}
+
+.pillInfo {
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.hiddenInput {
+  display: none;
+}
+
+.output {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cardList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--dsw-alias-border-primary, #d0d7de);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.cardHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cardTitle {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.cardMeta {
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.cardBody {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--dsw-alias-border-primary, #d0d7de);
+  padding-top: 8px;
+}
+
+.noteList,
+.commentList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.noteItem,
+.commentItem {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-size: 13px;
+}
+
+.commentMeta {
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.compareGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+}
+
+.compareCol {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.compareLabel {
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.modalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.decideBox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--dsw-alias-border-primary, #d0d7de);
+  border-radius: 8px;
+  padding: 10px;
+}
