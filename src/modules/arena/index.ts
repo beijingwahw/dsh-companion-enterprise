@@ -21,6 +21,8 @@ import { round4, tokenUsageToUsageLike } from '../../core/pricing.js'
 import {
   ARENA_MODEL_CATALOG,
   customModelToInfo,
+  deriveModelsFromIds,
+  isAllowedArenaOrigin,
   recommendModels,
   taskTypeLabel,
   type ArenaModelInfo,
@@ -63,11 +65,22 @@ export function apply(ctx: Context): void {
   /** 最近一次评测结果缓存（供导出复用，避免重跑评测）。 */
   let lastLeaderboard: { rows: LeaderboardRow[]; caseCount: number } | undefined
 
-  /** 完整模型列表：内置目录 + 用户自定义模型（自定义排后，按创建时间）。 */
+  /**
+   * 完整模型列表：内置目录 + 实时定价表新模型 + 用户自定义模型。
+   * 实时定价表来自动态计价引擎对各厂商官方定价页的抓取，厂商上新
+   * 模型后无需改代码即可自动出现在竞技场（最新模型自动导入）。
+   */
   async function listAllModels(): Promise<ArenaModelInfo[]> {
     const { domain } = await ctx.companion.ready
     const custom = new CustomModelStore(domain).list().map(customModelToInfo)
-    return [...ARENA_MODEL_CATALOG, ...custom]
+    const knownIds = new Set(ARENA_MODEL_CATALOG.map((model) => model.id))
+    // 实时定价表中的全部模型 id（含官方页新上架的模型）。
+    const liveIds: string[] = []
+    for (const vendor of ctx.companion.prices.vendorPricing(Date.now())) {
+      liveIds.push(...Object.keys(vendor.models))
+    }
+    const liveDerived = deriveModelsFromIds(liveIds, knownIds)
+    return [...ARENA_MODEL_CATALOG, ...liveDerived, ...custom]
   }
 
   // ------------------------------------------------------------------
@@ -108,6 +121,12 @@ export function apply(ctx: Context): void {
         const baseUrl = requireString(record.baseUrl, 'baseUrl')
         if (!/^https?:\/\//i.test(baseUrl)) {
           throw new HttpError('baseUrl 必须是 http(s):// 开头的完整地址', 400)
+        }
+        if (!isAllowedArenaOrigin(baseUrl)) {
+          throw new HttpError(
+            'baseUrl 域名不在 manifest.json 网络权限白名单内，无法直连',
+            400,
+          )
         }
         const latencyTier =
           record.latencyTier === 'fast' || record.latencyTier === 'slow'
@@ -168,10 +187,14 @@ export function apply(ctx: Context): void {
         const { vault } = await ctx.companion.ready
         await vault.setSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}`, apiKey)
         if (typeof record.baseUrl === 'string' && record.baseUrl.trim()) {
-          await vault.setSecret(
-            `${ARENA_KEY_SECRET_PREFIX}${modelId}:base-url`,
-            record.baseUrl.trim(),
-          )
+          const overrideUrl = record.baseUrl.trim()
+          if (!isAllowedArenaOrigin(overrideUrl)) {
+            throw new HttpError(
+              'baseUrl 域名不在 manifest.json 网络权限白名单内，无法直连',
+              400,
+            )
+          }
+          await vault.setSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}:base-url`, overrideUrl)
         }
         sendJson(res, 200, { ok: true })
       }),
@@ -337,7 +360,9 @@ async function runOneModel(ctx: Context, modelId: string, prompt: string): Promi
     (() => {
       const record = new CustomModelStore(domain).get(modelId)
       return record ? customModelToInfo(record) : undefined
-    })()
+    })() ??
+    // 实时定价表派生的新模型（厂商上新，未进静态目录）。
+    deriveModelsFromIds([modelId], new Set())[0]
   if (!model) {
     return failureResult(modelId, startedAt, `未知模型：${modelId}`)
   }
@@ -387,6 +412,10 @@ async function runExternalModel(
     (await vault.getSecret(`${ARENA_KEY_SECRET_PREFIX}${model.id}:base-url`)) ??
     model.baseUrl ??
     ''
+  // 最终防线：实际发起请求前再次确认目标域名在 manifest 白名单内。
+  if (!isAllowedArenaOrigin(baseUrl)) {
+    return failureResult(model.id, startedAt, '目标域名不在网络权限白名单内，已拒绝调用')
+  }
   const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {

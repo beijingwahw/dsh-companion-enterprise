@@ -174,6 +174,57 @@ const CURATED_MODELS: readonly ArenaModelInfo[] = [
 ]
 
 // ---------------------------------------------------------------------------
+// 网络权限白名单：与 manifest.json permissions.network.allowedOrigins 对齐
+// ---------------------------------------------------------------------------
+
+/**
+ * 竞技场允许直连的 API 域名白名单（与 manifest.json allowedOrigins 对齐）。
+ * 覆盖全部国产与海外主流厂商的 OpenAI 兼容端点及常见中转/聚合网关；
+ * 自定义模型与 Key 覆盖的 baseUrl 必须落在本白名单内。
+ */
+export const ARENA_ALLOWED_ORIGINS: readonly string[] = [
+  'https://api.deepseek.com',
+  'https://open.bigmodel.cn',
+  'https://api.moonshot.cn',
+  'https://dashscope.aliyuncs.com',
+  'https://ark.cn-beijing.volces.com',
+  'https://api.minimaxi.com',
+  'https://qianfan.baidubce.com',
+  'https://api.openai.com',
+  'https://api.anthropic.com',
+  'https://generativelanguage.googleapis.com',
+  'https://api.x.ai',
+  'https://api.mistral.ai',
+  'https://api.cohere.com',
+  'https://api.lingyiwanwu.com',
+  'https://api.stepfun.com',
+  'https://api.baichuan-ai.com',
+  'https://hunyuan.tencentcloudapi.com',
+  'https://spark-api-open.xf-yun.com',
+  // 第三方中转 / 聚合网关
+  'https://openrouter.ai',
+  'https://api.siliconflow.cn',
+  'https://api.together.xyz',
+  'https://api.groq.com',
+  'https://api.deepbricks.ai',
+  'https://api.302.ai',
+  'https://oa.api2d.net',
+  'https://api.closeai-asia.com',
+  'https://aiproxy.ohmygpt.com',
+]
+
+/** 校验 baseUrl 的 origin 是否在白名单内。 */
+export function isAllowedArenaOrigin(baseUrl: string): boolean {
+  let origin: string
+  try {
+    origin = new URL(baseUrl).origin
+  } catch {
+    return false
+  }
+  return ARENA_ALLOWED_ORIGINS.some((allowed) => new URL(allowed).origin === origin)
+}
+
+// ---------------------------------------------------------------------------
 // 全国产派生目录：自动覆盖价格目录中的全部国产模型
 // ---------------------------------------------------------------------------
 
@@ -216,16 +267,20 @@ function deriveLatencyTier(modelId: string): ArenaModelInfo['latencyTier'] {
 }
 
 /**
- * 从价格目录派生全部国产模型条目：
- * 价格目录（CATALOG_TABLE）中的每个模型，凡未被精选目录覆盖且厂商
- * 有 OpenAI 兼容端点的，自动生成竞技场条目。价格目录更新后竞技场
- * 自动跟随，无需手工维护。
+ * 为给定模型 id 集合生成竞技场条目（最新模型自动导入的核心）：
+ * 属于已知厂商且有 OpenAI 兼容端点、又未被精选目录覆盖的 id，
+ * 自动生成条目。静态目录与实时定价表上新模型共用本函数。
  */
-function deriveDomesticModels(): ArenaModelInfo[] {
+export function deriveModelsFromIds(
+  modelIds: Iterable<string>,
+  exclude: ReadonlySet<string>,
+): ArenaModelInfo[] {
   const curatedIds = new Set(CURATED_MODELS.map((model) => model.id))
   const derived: ArenaModelInfo[] = []
-  for (const modelId of Object.keys(CATALOG_TABLE)) {
-    if (curatedIds.has(modelId)) continue
+  const seen = new Set<string>()
+  for (const modelId of modelIds) {
+    if (exclude.has(modelId) || curatedIds.has(modelId) || seen.has(modelId)) continue
+    seen.add(modelId)
     const vendor = vendorOf(modelId)
     if (!vendor || vendor === 'deepseek') continue
     const baseUrl = VENDOR_BASE_URLS[vendor]
@@ -241,6 +296,11 @@ function deriveDomesticModels(): ArenaModelInfo[] {
     })
   }
   return derived
+}
+
+/** 从内置价格目录派生全部国产模型条目（静态基线）。 */
+function deriveDomesticModels(): ArenaModelInfo[] {
+  return deriveModelsFromIds(Object.keys(CATALOG_TABLE), new Set())
 }
 
 /** 完整内置目录：精选模型 + 全国产派生模型。 */

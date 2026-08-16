@@ -443,7 +443,8 @@ function KeysPanel(props: { models: readonly ArenaModelInfo[]; onChanged: () => 
     <section className={styles.section}>
       <p className={styles.hint}>
         外部厂商 Key 以 AES-256-GCM 加密保存在本地保险库，任何接口不回传明文。自定义模型走 OpenAI 兼容
-        chat/completions 协议，模型 id 若与价格目录一致可自动估算成本。
+        chat/completions 协议，模型 id 若与价格目录一致可自动估算成本。厂商官方定价页实时抓取的新模型
+        会自动出现在目录中，无需手工维护。
       </p>
       <div className={styles.row}>
         <Button size="sm" variant="primary" onClick={() => setAdding((prev) => !prev)}>

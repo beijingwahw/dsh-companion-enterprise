@@ -25,7 +25,7 @@ export interface Config {
   enableTeam: boolean
   /** 模块 J：安全与审计（企业开发者）。 */
   enableSecurity: boolean
-  /** DeepSeek 官方 API 基址（manifest.json 仅放行该域名）。 */
+  /** DeepSeek 官方 API 基址（manifest.json 已放行该域名）。 */
   apiBaseUrl: string
   /** 单次 API 调用超时（毫秒）。 */
   apiTimeoutMs: number
