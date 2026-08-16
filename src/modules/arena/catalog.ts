@@ -1,10 +1,16 @@
 /**
  * 模块 G：多模型竞技场 —— 模型目录与推荐引擎。
  *
- * 目录内置 DeepSeek 与常见外部模型的元信息（任务类型准确率先验、
- * 延迟档位）；外部厂商需用户另行配置 API Key（arena-keys 加密存储）。
- * 推荐引擎（G3）结合任务类型 + 预算 + 延迟要求 + 峰谷定价给出排序建议。
+ * 目录 = 精选模型（DeepSeek / 头部国产旗舰 / 海外，手工准确率先验）
+ *      + 全国产派生模型（自动来自 core/price/catalog.ts 价格目录，
+ *        价格目录新增模型时竞技场自动跟随，无需手工维护）
+ *      + 用户自定义模型（运行时存储，见 store.ts）。
+ * 外部厂商需用户另行配置 API Key（arena-keys 加密存储）。国产模型均走
+ * 各厂商的 OpenAI 兼容端点，模型 id 与价格目录一致，成本估算直接复用
+ * 计价引擎。推荐引擎（G3）结合任务类型 + 预算 + 延迟要求 + 峰谷定价
+ * 给出排序建议。
  */
+import { CATALOG_TABLE, VENDORS, vendorOf } from '../../core/price/catalog.js'
 import { isPeakTime } from '../../core/time.js'
 
 /** 任务类型。 */
@@ -22,10 +28,46 @@ export interface ArenaModelInfo {
   readonly accuracyPrior: Readonly<Record<TaskType, number>>
   /** 典型延迟档位：fast / balanced / slow。 */
   readonly latencyTier: 'fast' | 'balanced' | 'slow'
+  /** true=用户自定义模型（可删除，准确率先验取保守中值）。 */
+  readonly custom?: boolean
 }
 
-/** 内置模型目录（准确率先验为公开评测经验值，仅用于推荐排序）。 */
-export const ARENA_MODEL_CATALOG: readonly ArenaModelInfo[] = [
+/** 用户自定义模型记录（落盘于 arena-custom-models 表）。 */
+export interface CustomModelRecord {
+  /** 模型 id（同时作为 API 调用的 model 参数）。 */
+  readonly id: string
+  /** 展示名称。 */
+  readonly label: string
+  /** OpenAI 兼容 API 基址（如 https://api.example.com/v1）。 */
+  readonly baseUrl: string
+  readonly latencyTier: 'fast' | 'balanced' | 'slow'
+  readonly createdAt: number
+}
+
+/** 自定义模型缺省准确率先验（无公开评测数据，取保守中值）。 */
+const CUSTOM_ACCURACY_PRIOR: Readonly<Record<TaskType, number>> = {
+  code: 0.85,
+  translation: 0.85,
+  summarization: 0.85,
+  reasoning: 0.85,
+  general: 0.85,
+}
+
+/** 将自定义模型记录转换为目录条目。 */
+export function customModelToInfo(record: CustomModelRecord): ArenaModelInfo {
+  return {
+    id: record.id,
+    label: record.label,
+    provider: 'external',
+    baseUrl: record.baseUrl,
+    accuracyPrior: CUSTOM_ACCURACY_PRIOR,
+    latencyTier: record.latencyTier,
+    custom: true,
+  }
+}
+
+/** 精选模型目录（准确率先验为公开评测经验值，仅用于推荐排序）。 */
+const CURATED_MODELS: readonly ArenaModelInfo[] = [
   {
     id: 'deepseek-chat',
     label: 'DeepSeek V4-Flash（deepseek-chat）',
@@ -39,6 +81,79 @@ export const ARENA_MODEL_CATALOG: readonly ArenaModelInfo[] = [
     provider: 'deepseek',
     accuracyPrior: { code: 0.94, translation: 0.92, summarization: 0.92, reasoning: 0.95, general: 0.93 },
     latencyTier: 'slow',
+  },
+  // ---- 头部国产模型（均为 OpenAI 兼容端点，模型 id 与价格目录一致） ----
+  {
+    id: 'glm-4.7',
+    label: '智谱 GLM-4.7',
+    provider: 'external',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    accuracyPrior: { code: 0.92, translation: 0.9, summarization: 0.9, reasoning: 0.91, general: 0.9 },
+    latencyTier: 'balanced',
+  },
+  {
+    id: 'glm-4.7-flash',
+    label: '智谱 GLM-4.7-Flash（免费）',
+    provider: 'external',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    accuracyPrior: { code: 0.84, translation: 0.85, summarization: 0.86, reasoning: 0.8, general: 0.84 },
+    latencyTier: 'fast',
+  },
+  {
+    id: 'kimi-k2.6',
+    label: '月之暗面 Kimi K2.6',
+    provider: 'external',
+    baseUrl: 'https://api.moonshot.cn/v1',
+    accuracyPrior: { code: 0.91, translation: 0.9, summarization: 0.91, reasoning: 0.9, general: 0.9 },
+    latencyTier: 'balanced',
+  },
+  {
+    id: 'qwen3-max',
+    label: '通义千问 Qwen3-Max',
+    provider: 'external',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    accuracyPrior: { code: 0.92, translation: 0.92, summarization: 0.91, reasoning: 0.92, general: 0.92 },
+    latencyTier: 'balanced',
+  },
+  {
+    id: 'qwen3-flash',
+    label: '通义千问 Qwen3-Flash',
+    provider: 'external',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    accuracyPrior: { code: 0.85, translation: 0.86, summarization: 0.86, reasoning: 0.82, general: 0.85 },
+    latencyTier: 'fast',
+  },
+  {
+    id: 'doubao-seed-2.1-pro',
+    label: '豆包 Doubao-Seed-2.1-Pro',
+    provider: 'external',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    accuracyPrior: { code: 0.9, translation: 0.91, summarization: 0.91, reasoning: 0.89, general: 0.91 },
+    latencyTier: 'balanced',
+  },
+  {
+    id: 'doubao-seed-1.6-flash',
+    label: '豆包 Doubao-Seed-1.6-Flash',
+    provider: 'external',
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    accuracyPrior: { code: 0.83, translation: 0.85, summarization: 0.85, reasoning: 0.79, general: 0.84 },
+    latencyTier: 'fast',
+  },
+  {
+    id: 'minimax-m2.7',
+    label: 'MiniMax M2.7',
+    provider: 'external',
+    baseUrl: 'https://api.minimaxi.com/v1',
+    accuracyPrior: { code: 0.89, translation: 0.88, summarization: 0.89, reasoning: 0.88, general: 0.88 },
+    latencyTier: 'balanced',
+  },
+  {
+    id: 'ernie-4.5',
+    label: '文心 ERNIE-4.5',
+    provider: 'external',
+    baseUrl: 'https://qianfan.baidubce.com/v2',
+    accuracyPrior: { code: 0.88, translation: 0.9, summarization: 0.9, reasoning: 0.88, general: 0.9 },
+    latencyTier: 'balanced',
   },
   {
     id: 'gpt-4o',
@@ -56,6 +171,82 @@ export const ARENA_MODEL_CATALOG: readonly ArenaModelInfo[] = [
     accuracyPrior: { code: 0.95, translation: 0.92, summarization: 0.93, reasoning: 0.94, general: 0.94 },
     latencyTier: 'balanced',
   },
+]
+
+// ---------------------------------------------------------------------------
+// 全国产派生目录：自动覆盖价格目录中的全部国产模型
+// ---------------------------------------------------------------------------
+
+/** 厂商 → OpenAI 兼容 API 基址（派生模型调用入口）。 */
+const VENDOR_BASE_URLS: Readonly<Record<string, string>> = {
+  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
+  moonshot: 'https://api.moonshot.cn/v1',
+  qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  doubao: 'https://ark.cn-beijing.volces.com/api/v3',
+  minimax: 'https://api.minimaxi.com/v1',
+  ernie: 'https://qianfan.baidubce.com/v2',
+}
+
+/** 派生模型的缺省准确率先验（无逐模型评测数据，按厂商整体水平取经验值）。 */
+const VENDOR_ACCURACY_PRIOR: Readonly<Record<string, Readonly<Record<TaskType, number>>>> = {
+  zhipu: { code: 0.86, translation: 0.86, summarization: 0.87, reasoning: 0.85, general: 0.86 },
+  moonshot: { code: 0.87, translation: 0.87, summarization: 0.88, reasoning: 0.86, general: 0.87 },
+  qwen: { code: 0.87, translation: 0.88, summarization: 0.87, reasoning: 0.86, general: 0.87 },
+  doubao: { code: 0.85, translation: 0.87, summarization: 0.87, reasoning: 0.84, general: 0.87 },
+  minimax: { code: 0.84, translation: 0.84, summarization: 0.85, reasoning: 0.83, general: 0.84 },
+  ernie: { code: 0.84, translation: 0.86, summarization: 0.86, reasoning: 0.84, general: 0.86 },
+}
+
+/** 派生模型缺省先验（厂商未在上表时使用）。 */
+const DERIVED_FALLBACK_PRIOR: Readonly<Record<TaskType, number>> = {
+  code: 0.83,
+  translation: 0.84,
+  summarization: 0.84,
+  reasoning: 0.82,
+  general: 0.84,
+}
+
+/** 模型名含这些关键词时判定为快速档（轻量/免费档）。 */
+const FAST_TIER_KEYWORDS = ['flash', 'lite', 'turbo', 'speed', 'air']
+
+/** 推断派生模型延迟档位：名字含轻量关键词 → fast，其余 balanced。 */
+function deriveLatencyTier(modelId: string): ArenaModelInfo['latencyTier'] {
+  const id = modelId.toLowerCase()
+  return FAST_TIER_KEYWORDS.some((keyword) => id.includes(keyword)) ? 'fast' : 'balanced'
+}
+
+/**
+ * 从价格目录派生全部国产模型条目：
+ * 价格目录（CATALOG_TABLE）中的每个模型，凡未被精选目录覆盖且厂商
+ * 有 OpenAI 兼容端点的，自动生成竞技场条目。价格目录更新后竞技场
+ * 自动跟随，无需手工维护。
+ */
+function deriveDomesticModels(): ArenaModelInfo[] {
+  const curatedIds = new Set(CURATED_MODELS.map((model) => model.id))
+  const derived: ArenaModelInfo[] = []
+  for (const modelId of Object.keys(CATALOG_TABLE)) {
+    if (curatedIds.has(modelId)) continue
+    const vendor = vendorOf(modelId)
+    if (!vendor || vendor === 'deepseek') continue
+    const baseUrl = VENDOR_BASE_URLS[vendor]
+    if (!baseUrl) continue
+    const vendorLabel = VENDORS[vendor]?.label ?? vendor
+    derived.push({
+      id: modelId,
+      label: `${vendorLabel} ${modelId}`,
+      provider: 'external',
+      baseUrl,
+      accuracyPrior: VENDOR_ACCURACY_PRIOR[vendor] ?? DERIVED_FALLBACK_PRIOR,
+      latencyTier: deriveLatencyTier(modelId),
+    })
+  }
+  return derived
+}
+
+/** 完整内置目录：精选模型 + 全国产派生模型。 */
+export const ARENA_MODEL_CATALOG: readonly ArenaModelInfo[] = [
+  ...CURATED_MODELS,
+  ...deriveDomesticModels(),
 ]
 
 /** 延迟档位 → 数值（用于推荐打分）。 */
@@ -85,14 +276,16 @@ export interface Recommendation {
  * 模型推荐引擎（G3）：
  * 得分 = 准确率先验 × 0.6 + 延迟匹配 × 0.25 + 成本优势 × 0.15；
  * 峰谷感知：空闲时段在理由中提示低成本窗口。
+ * models 传入完整候选列表（内置目录 + 用户自定义模型）。
  */
 export function recommendModels(
+  models: readonly ArenaModelInfo[],
   request: RecommendRequest,
   costPerCall: Readonly<Record<string, number>>,
   now: number = Date.now(),
 ): Recommendation[] {
   const offPeak = !isPeakTime(now)
-  const candidates = ARENA_MODEL_CATALOG.filter((model) => {
+  const candidates = models.filter((model) => {
     if (request.latencyRequirement === 'fast' && model.latencyTier === 'slow') return false
     if (request.budgetPerCallCny > 0) {
       const cost = costPerCall[model.id]
