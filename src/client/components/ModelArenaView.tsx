@@ -27,6 +27,18 @@ export interface ModelArenaViewProps {
   readonly sessionId?: string
 }
 
+/**
+ * 全模型峰谷感知徽标：
+ * - 高峰时段且有峰谷分时价的模型 → 标注"高峰价"；
+ * - 空闲时段且有峰谷分时价的模型 → 标注"空闲价"；
+ * - 无峰谷分时价的模型 → 不显示徽标（全天统一价，价格不被篡改）。
+ */
+function peakBadge(model: ArenaModelInfo): string {
+  const status = model.peakStatus
+  if (status === undefined || !status.hasPeakPricing) return ''
+  return status.isPeak ? '（高峰价）' : '（空闲价）'
+}
+
 /** 子面板页签。 */
 type Tab = 'compare' | 'leaderboard' | 'recommend' | 'keys'
 
@@ -128,7 +140,7 @@ function ComparePanel(props: { models: readonly ArenaModelInfo[] }): ReactElemen
           <label key={model.id} className={styles.modelOption}>
             <Checkbox
               checked={selected.has(model.id)}
-              label={`${model.label}${model.provider === 'external' && !model.keyConfigured ? '（未配置 Key）' : ''}`}
+              label={`${model.label}${peakBadge(model)}${model.provider === 'external' && !model.keyConfigured ? '（未配置 Key）' : ''}`}
               onChange={() => toggle(model.id)}
             />
           </label>
@@ -226,7 +238,11 @@ function LeaderboardPanel(props: { models: readonly ArenaModelInfo[] }): ReactEl
       <div className={styles.modelGrid}>
         {models.map((model) => (
           <label key={model.id} className={styles.modelOption}>
-            <Checkbox checked={selected.has(model.id)} label={model.label} onChange={() => toggle(model.id)} />
+            <Checkbox
+              checked={selected.has(model.id)}
+              label={`${model.label}${peakBadge(model)}`}
+              onChange={() => toggle(model.id)}
+            />
           </label>
         ))}
       </div>

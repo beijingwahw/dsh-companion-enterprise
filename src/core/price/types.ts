@@ -62,4 +62,6 @@ export interface VendorPricing {
   source: 'live' | 'builtin' | 'override'
   fetchedAt?: number
   models: PriceTable
+  /** 该厂商的峰谷分时计划（官方未公布峰谷价时缺省）。 */
+  scheduled?: ScheduledPricing
 }

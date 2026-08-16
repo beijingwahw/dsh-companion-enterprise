@@ -497,6 +497,10 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
             </div>
           ) : null}
           <div className={styles.hint}>
+            全模型峰谷感知：峰谷时段判定对全部模型统一生效；官方公布峰谷分时价的厂商按时段取价，
+            未公布峰谷价的厂商全天按统一价计费（价格不被篡改）。
+          </div>
+          <div className={styles.hint}>
             每小时自动抓取 DeepSeek 与国产厂商官方定价页，新模型与调价自动导入；缓存命中按折扣价计费。
           </div>
           <div className={styles.budgetEdit}>

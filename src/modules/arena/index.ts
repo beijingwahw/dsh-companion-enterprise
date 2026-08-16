@@ -91,6 +91,7 @@ export function apply(ctx: Context): void {
       ctx.companion.http.add('GET', '/arena/models', async (_req, res) => {
         const { vault } = await ctx.companion.ready
         const models = await listAllModels()
+        const now = Date.now()
         sendJson(res, 200, {
           models: models.map((model) => ({
             id: model.id,
@@ -103,6 +104,8 @@ export function apply(ctx: Context): void {
               model.provider === 'deepseek'
                 ? undefined
                 : vault.hasSecret(`${ARENA_KEY_SECRET_PREFIX}${model.id}`),
+            // 全模型峰谷感知：当前是否高峰 + 该模型厂商是否有峰谷分时价。
+            peakStatus: ctx.companion.prices.peakStatusOf(model.id, now),
           })),
         })
       }),
@@ -321,19 +324,25 @@ export function apply(ctx: Context): void {
         const latencyRequirement =
           latency === 'fast' || latency === 'balanced' ? latency : 'any'
 
-        // 以典型用量估算各模型单次成本（动态计价引擎，峰谷感知）。
+        // 以典型用量估算各模型单次成本（动态计价引擎，全模型峰谷感知）。
         const models = await listAllModels()
         const now = Date.now()
         const costPerCall: Record<string, number> = {}
+        // 收集公布了峰谷分时价的模型 id（推荐理由按模型区分峰谷文案）。
+        const peakPricingModels = new Set<string>()
         for (const model of models) {
           const cost = ctx.companion.prices.costOfCall(model.id, TYPICAL_USAGE, now)
           costPerCall[model.id] = round4(cost)
+          if (ctx.companion.prices.peakStatusOf(model.id, now).hasPeakPricing) {
+            peakPricingModels.add(model.id)
+          }
         }
         const recommendations = recommendModels(
           models,
           { taskType, budgetPerCallCny, latencyRequirement },
           costPerCall,
           now,
+          peakPricingModels,
         )
         sendJson(res, 200, {
           taskType,

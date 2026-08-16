@@ -335,7 +335,8 @@ export interface Recommendation {
 /**
  * 模型推荐引擎（G3）：
  * 得分 = 准确率先验 × 0.6 + 延迟匹配 × 0.25 + 成本优势 × 0.15；
- * 峰谷感知：空闲时段在理由中提示低成本窗口。
+ * 全模型峰谷感知：成本估算经动态计价引擎按时段取价；推荐理由按模型
+ * 是否公布峰谷分时价区分文案（peakPricingModels 传入有峰谷价的模型 id 集合）。
  * models 传入完整候选列表（内置目录 + 用户自定义模型）。
  */
 export function recommendModels(
@@ -343,6 +344,7 @@ export function recommendModels(
   request: RecommendRequest,
   costPerCall: Readonly<Record<string, number>>,
   now: number = Date.now(),
+  peakPricingModels: ReadonlySet<string> = new Set(),
 ): Recommendation[] {
   const offPeak = !isPeakTime(now)
   const candidates = models.filter((model) => {
@@ -373,20 +375,28 @@ export function recommendModels(
     const cost = costPerCall[model.id] ?? 0
     const costScore = maxCost > minCost ? 1 - (cost - minCost) / (maxCost - minCost) : 1
     const score = accuracy * 0.6 + latencyScore * 0.25 + costScore * 0.15
-    const reason = buildReason(model, request, cost, offPeak, costPerCall)
+    const reason = buildReason(
+      model,
+      request,
+      cost,
+      offPeak,
+      costPerCall,
+      peakPricingModels.has(model.id),
+    )
     return { model, score, reason }
   })
 
   return scored.sort((a, b) => b.score - a.score)
 }
 
-/** 生成推荐理由文案。 */
+/** 生成推荐理由文案（hasPeakPricing=该模型厂商是否公布峰谷分时价）。 */
 function buildReason(
   model: ArenaModelInfo,
   request: RecommendRequest,
   cost: number,
   offPeak: boolean,
   costPerCall: Readonly<Record<string, number>>,
+  hasPeakPricing: boolean,
 ): string {
   const parts: string[] = []
   const accuracy = model.accuracyPrior[request.taskType] ?? 0.85
@@ -403,11 +413,15 @@ function buildReason(
           `当前为空闲时段，成本仅为 ${topId} 的 ${(cost / topCost).toFixed(2)} 倍`,
         )
       }
+    } else if (hasPeakPricing) {
+      parts.push('当前为空闲时段（该模型按峰谷优惠价计费）')
     } else {
-      parts.push('当前为空闲时段（峰谷定价优惠窗口）')
+      parts.push('当前为空闲时段（该模型全天统一价）')
     }
+  } else if (hasPeakPricing) {
+    parts.push('当前为高峰时段（该模型按高峰价计费），可考虑延迟非紧急任务至空闲时段')
   } else {
-    parts.push('当前为高峰时段，可考虑延迟非紧急任务至空闲时段')
+    parts.push('当前为高峰时段（该模型全天统一价，不受峰谷影响）')
   }
   return parts.join('；')
 }

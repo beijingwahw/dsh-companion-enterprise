@@ -110,6 +110,31 @@ export function resolvePrice(sheet: PriceSheet, model: string, atMs: number): Mo
   return table[model]
 }
 
+/**
+ * 在基础价表上叠加某厂商的分时计划（全模型峰谷感知的通用解析）：
+ * 计划已生效时按时段取峰/谷价表，并与基础价表合并——分时表未覆盖的模型
+ * 沿用基础（全天统一）价，保证官方未公布峰谷价的模型价格不被篡改。
+ */
+export function resolveScheduledTable(
+  base: PriceTable,
+  scheduled: ScheduledPricing | undefined,
+  atMs: number,
+): PriceTable {
+  if (scheduled === undefined || beijingDayKey(atMs) < scheduled.effective) return base
+  const periodTable = isPeakTimeAt(atMs, scheduled.peakWindows ?? DEFAULT_PEAK_WINDOWS)
+    ? scheduled.peak
+    : scheduled.offPeak
+  return { ...base, ...periodTable }
+}
+
+/** 某模型在某时刻的峰谷状态（供面板与推荐引擎展示）。 */
+export interface ModelPeakStatus {
+  /** 当前是否处于高峰时段（北京时间，全模型统一判定）。 */
+  isPeak: boolean
+  /** 该模型所属厂商是否公布了峰谷分时价（false=全天统一价）。 */
+  hasPeakPricing: boolean
+}
+
 /** 带超时抓取 URL 文本。 */
 export async function fetchText(
   url: string,
@@ -351,6 +376,12 @@ export class PriceService {
   private overrides: PriceTable = {}
   /** 各厂商官方定价页实时抓取表（新模型落在这里）。 */
   private vendorLive = new Map<string, { table: PriceTable; fetchedAt: number }>()
+  /**
+   * 逐厂商峰谷分时计划（全模型峰谷感知的数据源）：
+   * 官方定价页解析出峰谷价的厂商落在这里；未公布峰谷价的厂商无条目，
+   * 其模型全天按统一价计费，价格不被篡改。
+   */
+  private vendorScheduled = new Map<string, ScheduledPricing>()
   /** 官方价格内容变化回调（供持久化与提示）。 */
   onChanged?: (sheet: PriceSheet) => void
 
@@ -390,6 +421,35 @@ export class PriceService {
     return this.changedAt
   }
 
+  /** 某厂商的峰谷分时计划（官方未公布峰谷价时 undefined）。 */
+  vendorScheduledOf(vendorId: string): ScheduledPricing | undefined {
+    return this.vendorScheduled.get(vendorId)
+  }
+
+  /** 登记某厂商的峰谷分时计划（官方定价页解析出峰谷价时调用）。 */
+  setVendorScheduled(vendorId: string, scheduled: ScheduledPricing): void {
+    this.vendorScheduled.set(vendorId, scheduled)
+  }
+
+  /**
+   * 某模型在某时刻的峰谷状态（全模型峰谷感知）：
+   * isPeak 按北京时间统一判定；hasPeakPricing 反映该模型所属厂商
+   * 是否公布了峰谷分时价（DeepSeek v4 系列经 sheet.scheduled，
+   * 其余厂商经 vendorScheduled）。
+   */
+  peakStatusOf(model: string, atMs: number): ModelPeakStatus {
+    const isPeak = isPeakTimeAt(atMs, this.activePeakWindows())
+    const id = model.trim().toLowerCase()
+    const vendor = vendorOf(id)
+    const hasPeakPricing =
+      vendor === 'deepseek'
+        ? this.sheet.scheduled !== undefined && beijingDayKey(atMs) >= this.sheet.scheduled.effective
+        : vendor !== undefined &&
+          this.vendorScheduled.has(vendor) &&
+          beijingDayKey(atMs) >= (this.vendorScheduled.get(vendor)?.effective ?? '')
+    return { isPeak, hasPeakPricing }
+  }
+
   /** 当前生效的高峰时段窗口（分时计划优先，缺省官方约定窗口）。 */
   activePeakWindows(): ReadonlyArray<readonly [number, number]> {
     const scheduled = this.sheet.scheduled
@@ -417,8 +477,8 @@ export class PriceService {
 
   /**
    * 某模型在某时刻的单价。优先级：用户覆盖 > DeepSeek 实时/内置表 >
-   * 厂商实时表（自动导入的新模型）> 内置目录精确 > 最长前缀匹配
-   * （覆盖 `glm-4.6-250414` 这类带日期快照名）。undefined 表示无价可计。
+   * 厂商实时表（自动导入的新模型，逐厂商峰谷计划感知）> 内置目录精确 >
+   * 最长前缀匹配（覆盖 `glm-4.6-250414` 这类带日期快照名）。undefined 表示无价可计。
    */
   resolve(model: string, atMs: number): ModelPrice | undefined {
     const id = model.trim().toLowerCase()
@@ -430,7 +490,9 @@ export class PriceService {
     if (vendor !== undefined) {
       const live = this.vendorLive.get(vendor)
       if (live !== undefined) {
-        const hit = live.table[id] ?? matchByPrefix(live.table, id)
+        // 全模型峰谷感知：厂商公布了峰谷价时按时段取价。
+        const table = resolveScheduledTable(live.table, this.vendorScheduled.get(vendor), atMs)
+        const hit = table[id] ?? matchByPrefix(table, id)
         if (hit !== undefined) return hit
       }
     }
@@ -454,6 +516,7 @@ export class PriceService {
       source: this.sheet.source === 'live' ? 'live' : 'builtin',
       fetchedAt: this.sheet.fetchedAt,
       models: deepseekModels,
+      scheduled: this.sheet.scheduled,
     })
     seen.add('deepseek')
     // 其余国产厂商：实时抓取表优先，目录兜底。
@@ -482,6 +545,8 @@ export class PriceService {
           source,
           fetchedAt: live?.fetchedAt,
           models,
+          // 全模型峰谷感知：官方公布峰谷价的厂商在此携带分时计划。
+          scheduled: this.vendorScheduled.get(vendorId),
         })
       }
     }

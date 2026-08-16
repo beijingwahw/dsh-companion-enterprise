@@ -366,6 +366,13 @@ export interface VendorPricing {
   readonly source: 'live' | 'builtin' | 'override'
   readonly fetchedAt?: number
   readonly models: Readonly<Record<string, ModelPrice>>
+  /** 全模型峰谷感知：该厂商的峰谷分时计划（官方未公布峰谷价时缺省）。 */
+  readonly scheduled?: Readonly<{
+    readonly effective: string
+    readonly peakWindows?: ReadonlyArray<readonly [number, number]>
+    readonly offPeak: Readonly<Record<string, ModelPrice>>
+    readonly peak: Readonly<Record<string, ModelPrice>>
+  }>
 }
 
 /** 动态计价引擎面板数据（`GET /cost/pricing` 与 /cost/state.pricing）。 */
@@ -929,6 +936,11 @@ export interface ArenaModelInfo {
   readonly custom?: boolean
   /** 外部厂商 Key 是否已配置（deepseek 模型为 undefined）。 */
   readonly keyConfigured?: boolean
+  /** 全模型峰谷感知：当前是否高峰 + 该模型厂商是否公布峰谷分时价。 */
+  readonly peakStatus?: Readonly<{
+    readonly isPeak: boolean
+    readonly hasPeakPricing: boolean
+  }>
 }
 
 /** G1 单模型运行结果。 */
