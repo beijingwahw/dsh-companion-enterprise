@@ -81,6 +81,8 @@ const ALL_TABLE_NAMES = [
   'cost-extra', 'budget-state',
   // search
   'tags',
+  // arena
+  'arena-custom-models',
   // trace
   'traces', 'trace-stats-daily',
   // prompt

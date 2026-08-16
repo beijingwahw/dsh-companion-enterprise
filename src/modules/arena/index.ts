@@ -2,13 +2,15 @@
  * 模块 G：多模型竞技场（arena）插件入口。
  *
  * HTTP 端点（经 ctx.companion.http 挂载）：
- * - GET  /arena/models       模型目录（含外部厂商 Key 配置状态）；
- * - POST /arena/keys         保存外部厂商 API Key（AES-256-GCM 加密落盘）；
- * - DELETE /arena/keys       删除外部厂商 API Key；
- * - POST /arena/compare      G1 同 Prompt 多模型并行对比（最多 5 个模型）；
- * - POST /arena/leaderboard  G2 批量评测排行榜（JSON/JSONL 测试集，
- *                            准确率/延迟分位/Token/成本/合规率，报告 MD/HTML）；
- * - GET  /arena/recommend    G3 模型推荐引擎（任务类型+预算+延迟+峰谷感知）。
+ * - GET    /arena/models        模型目录（内置 + 自定义，含 Key 配置状态）；
+ * - POST   /arena/keys          保存外部厂商 API Key（AES-256-GCM 加密落盘）；
+ * - DELETE /arena/keys          删除外部厂商 API Key（自定义模型级联删除）；
+ * - POST   /arena/custom-models 添加/更新用户自定义模型（OpenAI 兼容）；
+ * - DELETE /arena/custom-models 删除用户自定义模型（连同其 Key）；
+ * - POST   /arena/compare       G1 同 Prompt 多模型并行对比（最多 5 个模型）；
+ * - POST   /arena/leaderboard   G2 批量评测排行榜（JSON/JSONL 测试集，
+ *                               准确率/延迟分位/Token/成本/合规率，报告 MD/HTML）；
+ * - GET    /arena/recommend     G3 模型推荐引擎（任务类型+预算+延迟+峰谷感知）。
  *
  * 外部厂商调用走 OpenAI 兼容 chat/completions 协议；baseUrl 可随 Key 一并
  * 配置（指向任意兼容网关）。安全红线：任何响应不回传 Key 明文。
@@ -18,11 +20,13 @@ import { HttpError, sendJson } from '../../core/http.js'
 import { round4, tokenUsageToUsageLike } from '../../core/pricing.js'
 import {
   ARENA_MODEL_CATALOG,
+  customModelToInfo,
   recommendModels,
   taskTypeLabel,
   type ArenaModelInfo,
   type TaskType,
 } from './catalog.js'
+import { CustomModelStore } from './store.js'
 
 /** 插件名。 */
 export const name = 'companion-arena'
@@ -59,20 +63,29 @@ export function apply(ctx: Context): void {
   /** 最近一次评测结果缓存（供导出复用，避免重跑评测）。 */
   let lastLeaderboard: { rows: LeaderboardRow[]; caseCount: number } | undefined
 
+  /** 完整模型列表：内置目录 + 用户自定义模型（自定义排后，按创建时间）。 */
+  async function listAllModels(): Promise<ArenaModelInfo[]> {
+    const { domain } = await ctx.companion.ready
+    const custom = new CustomModelStore(domain).list().map(customModelToInfo)
+    return [...ARENA_MODEL_CATALOG, ...custom]
+  }
+
   // ------------------------------------------------------------------
-  // GET /arena/models：模型目录 + Key 配置状态
+  // GET /arena/models：模型目录（内置 + 自定义）+ Key 配置状态
   // ------------------------------------------------------------------
   ctx.effect(
     () =>
       ctx.companion.http.add('GET', '/arena/models', async (_req, res) => {
         const { vault } = await ctx.companion.ready
+        const models = await listAllModels()
         sendJson(res, 200, {
-          models: ARENA_MODEL_CATALOG.map((model) => ({
+          models: models.map((model) => ({
             id: model.id,
             label: model.label,
             provider: model.provider,
             latencyTier: model.latencyTier,
             accuracyPrior: model.accuracyPrior,
+            custom: model.custom ?? false,
             keyConfigured:
               model.provider === 'deepseek'
                 ? undefined
@@ -84,7 +97,63 @@ export function apply(ctx: Context): void {
   )
 
   // ------------------------------------------------------------------
-  // POST /arena/keys：保存外部厂商 Key（加密落盘）
+  // POST /arena/custom-models：添加/更新用户自定义模型
+  // ------------------------------------------------------------------
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('POST', '/arena/custom-models', async (_req, res, { body }) => {
+        const record = readObject(body)
+        const modelId = requireString(record.modelId, 'modelId')
+        const label = requireString(record.label, 'label')
+        const baseUrl = requireString(record.baseUrl, 'baseUrl')
+        if (!/^https?:\/\//i.test(baseUrl)) {
+          throw new HttpError('baseUrl 必须是 http(s):// 开头的完整地址', 400)
+        }
+        const latencyTier =
+          record.latencyTier === 'fast' || record.latencyTier === 'slow'
+            ? record.latencyTier
+            : 'balanced'
+        if (ARENA_MODEL_CATALOG.some((model) => model.id === modelId)) {
+          throw new HttpError(`模型 id ${modelId} 与内置目录冲突，请换一个 id`, 400)
+        }
+        const { domain } = await ctx.companion.ready
+        const store = new CustomModelStore(domain)
+        const existing = store.get(modelId)
+        await store.save({
+          id: modelId,
+          label,
+          baseUrl: baseUrl.replace(/\/+$/, ''),
+          latencyTier,
+          createdAt: existing?.createdAt ?? Date.now(),
+        })
+        sendJson(res, 200, { ok: true })
+      }),
+    'companion.arena-http-add-custom-model',
+  )
+
+  // ------------------------------------------------------------------
+  // DELETE /arena/custom-models：删除用户自定义模型（连同其 Key）
+  // ------------------------------------------------------------------
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('DELETE', '/arena/custom-models', async (_req, res, { body }) => {
+        const record = readObject(body)
+        const modelId = requireString(record.modelId, 'modelId')
+        const { domain, vault } = await ctx.companion.ready
+        const store = new CustomModelStore(domain)
+        if (!store.get(modelId)) {
+          throw new HttpError(`自定义模型 ${modelId} 不存在`, 404)
+        }
+        await store.delete(modelId)
+        await vault.deleteSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}`)
+        await vault.deleteSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}:base-url`)
+        sendJson(res, 200, { ok: true })
+      }),
+    'companion.arena-http-delete-custom-model',
+  )
+
+  // ------------------------------------------------------------------
+  // POST /arena/keys：保存外部厂商 Key（加密落盘，支持内置与自定义模型）
   // ------------------------------------------------------------------
   ctx.effect(
     () =>
@@ -92,7 +161,7 @@ export function apply(ctx: Context): void {
         const record = readObject(body)
         const modelId = requireString(record.modelId, 'modelId')
         const apiKey = requireString(record.apiKey, 'apiKey')
-        const model = ARENA_MODEL_CATALOG.find((m) => m.id === modelId)
+        const model = (await listAllModels()).find((m) => m.id === modelId)
         if (!model || model.provider !== 'external') {
           throw new HttpError(`模型 ${modelId} 不是外部厂商模型`, 400)
         }
@@ -110,16 +179,21 @@ export function apply(ctx: Context): void {
   )
 
   // ------------------------------------------------------------------
-  // DELETE /arena/keys：删除外部厂商 Key
+  // DELETE /arena/keys：删除外部厂商 Key（自定义模型同时删除模型本身）
   // ------------------------------------------------------------------
   ctx.effect(
     () =>
       ctx.companion.http.add('DELETE', '/arena/keys', async (_req, res, { body }) => {
         const record = readObject(body)
         const modelId = requireString(record.modelId, 'modelId')
-        const { vault } = await ctx.companion.ready
+        const { domain, vault } = await ctx.companion.ready
         await vault.deleteSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}`)
         await vault.deleteSecret(`${ARENA_KEY_SECRET_PREFIX}${modelId}:base-url`)
+        // 自定义模型的 Key 面板“删除”即整体移除（模型记录 + Key）。
+        const store = new CustomModelStore(domain)
+        if (store.get(modelId)) {
+          await store.delete(modelId)
+        }
         sendJson(res, 200, { ok: true })
       }),
     'companion.arena-http-clear-keys',
@@ -213,7 +287,7 @@ export function apply(ctx: Context): void {
   // ------------------------------------------------------------------
   ctx.effect(
     () =>
-      ctx.companion.http.add('GET', '/arena/recommend', (_req, res, { query }) => {
+      ctx.companion.http.add('GET', '/arena/recommend', async (_req, res, { query }) => {
         const taskType = parseTaskType(query.get('taskType'))
         const budgetRaw = query.get('budgetPerCallCny')
         const budgetPerCallCny = budgetRaw === null ? 0 : Number(budgetRaw)
@@ -225,13 +299,15 @@ export function apply(ctx: Context): void {
           latency === 'fast' || latency === 'balanced' ? latency : 'any'
 
         // 以典型用量估算各模型单次成本（动态计价引擎，峰谷感知）。
+        const models = await listAllModels()
         const now = Date.now()
         const costPerCall: Record<string, number> = {}
-        for (const model of ARENA_MODEL_CATALOG) {
+        for (const model of models) {
           const cost = ctx.companion.prices.costOfCall(model.id, TYPICAL_USAGE, now)
           costPerCall[model.id] = round4(cost)
         }
         const recommendations = recommendModels(
+          models,
           { taskType, budgetPerCallCny, latencyRequirement },
           costPerCall,
           now,
@@ -254,8 +330,14 @@ export function apply(ctx: Context): void {
 
 /** 运行单个模型（DeepSeek 走核心服务记账，外部厂商走兼容协议直连）。 */
 async function runOneModel(ctx: Context, modelId: string, prompt: string): Promise<ArenaRunResult> {
-  const model = ARENA_MODEL_CATALOG.find((m) => m.id === modelId)
   const startedAt = Date.now()
+  const { domain } = await ctx.companion.ready
+  const model =
+    ARENA_MODEL_CATALOG.find((m) => m.id === modelId) ??
+    (() => {
+      const record = new CustomModelStore(domain).get(modelId)
+      return record ? customModelToInfo(record) : undefined
+    })()
   if (!model) {
     return failureResult(modelId, startedAt, `未知模型：${modelId}`)
   }

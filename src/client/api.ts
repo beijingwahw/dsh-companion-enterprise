@@ -925,6 +925,8 @@ export interface ArenaModelInfo {
   readonly provider: 'deepseek' | 'external'
   readonly latencyTier: 'fast' | 'balanced' | 'slow'
   readonly accuracyPrior: Readonly<Record<string, number>>
+  /** true=用户自定义模型（可删除）。 */
+  readonly custom?: boolean
   /** 外部厂商 Key 是否已配置（deepseek 模型为 undefined）。 */
   readonly keyConfigured?: boolean
 }
@@ -977,6 +979,21 @@ export function saveArenaKey(request: { modelId: string; apiKey: string; baseUrl
 /** 删除外部厂商 API Key。 */
 export function removeArenaKey(modelId: string): Promise<OkResponse> {
   return companionDelete<OkResponse>('/arena/keys', { modelId })
+}
+
+/** 添加/更新用户自定义模型（OpenAI 兼容）。 */
+export function addArenaCustomModel(request: {
+  modelId: string
+  label: string
+  baseUrl: string
+  latencyTier?: 'fast' | 'balanced' | 'slow'
+}): Promise<OkResponse> {
+  return companionPost<OkResponse>('/arena/custom-models', request)
+}
+
+/** 删除用户自定义模型（连同其 Key）。 */
+export function removeArenaCustomModel(modelId: string): Promise<OkResponse> {
+  return companionDelete<OkResponse>('/arena/custom-models', { modelId })
 }
 
 /** G1 同 Prompt 多模型并行对比。 */

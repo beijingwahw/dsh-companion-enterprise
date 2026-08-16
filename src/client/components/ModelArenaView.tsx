@@ -9,9 +9,11 @@ import { useCallback, useEffect, useState } from 'react'
 import type { ReactElement } from 'react'
 import { Button, Checkbox, Input, Select, Spinner, Textarea, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
+  addArenaCustomModel,
   downloadBlob,
   fetchArenaModels,
   fetchArenaRecommendation,
+  removeArenaCustomModel,
   removeArenaKey,
   runArenaCompare,
   runArenaLeaderboard,
@@ -57,7 +59,7 @@ export function ModelArenaView(_props: ModelArenaViewProps): ReactElement {
           模型推荐
         </Button>
         <Button size="sm" variant={tab === 'keys' ? 'primary' : 'secondary'} onClick={() => setTab('keys')}>
-          外部 Key 管理
+          模型与 Key 管理
         </Button>
       </div>
       {tab === 'compare' && <ComparePanel models={models} />}
@@ -359,12 +361,17 @@ function RecommendPanel(): ReactElement {
   )
 }
 
-/** 外部厂商 Key 管理面板。 */
+/** 外部厂商 Key 与自定义模型管理面板。 */
 function KeysPanel(props: { models: readonly ArenaModelInfo[]; onChanged: () => void }): ReactElement {
   const { models, onChanged } = props
   const [editing, setEditing] = useState<string | undefined>()
   const [apiKey, setApiKey] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [adding, setAdding] = useState(false)
+  const [customId, setCustomId] = useState('')
+  const [customLabel, setCustomLabel] = useState('')
+  const [customBaseUrl, setCustomBaseUrl] = useState('')
+  const [customLatency, setCustomLatency] = useState('balanced')
 
   const save = useCallback(async () => {
     if (!editing || !apiKey.trim()) return
@@ -393,15 +400,80 @@ function KeysPanel(props: { models: readonly ArenaModelInfo[]; onChanged: () => 
     [onChanged],
   )
 
+  /** 添加自定义模型（前端先做基础校验，服务端再做冲突与格式校验）。 */
+  const addCustom = useCallback(async () => {
+    if (!customId.trim() || !customLabel.trim() || !customBaseUrl.trim()) return
+    if (!/^https?:\/\//i.test(customBaseUrl.trim())) {
+      Toast.push('API 基址必须以 http:// 或 https:// 开头', 'warning')
+      return
+    }
+    try {
+      await addArenaCustomModel({
+        modelId: customId.trim(),
+        label: customLabel.trim(),
+        baseUrl: customBaseUrl.trim(),
+        latencyTier: customLatency as 'fast' | 'balanced' | 'slow',
+      })
+      Toast.push('自定义模型已添加，请为其配置 API Key', 'success')
+      setAdding(false)
+      setCustomId('')
+      setCustomLabel('')
+      setCustomBaseUrl('')
+      setCustomLatency('balanced')
+      onChanged()
+    } catch (err) {
+      Toast.push(err instanceof Error ? err.message : '添加失败', 'error')
+    }
+  }, [customId, customLabel, customBaseUrl, customLatency, onChanged])
+
+  const removeCustom = useCallback(
+    async (modelId: string) => {
+      try {
+        await removeArenaCustomModel(modelId)
+        Toast.push('自定义模型已删除', 'success')
+        onChanged()
+      } catch (err) {
+        Toast.push(err instanceof Error ? err.message : '删除失败', 'error')
+      }
+    },
+    [onChanged],
+  )
+
   return (
     <section className={styles.section}>
-      <p className={styles.hint}>外部厂商 Key 以 AES-256-GCM 加密保存在本地保险库，任何接口不回传明文。</p>
+      <p className={styles.hint}>
+        外部厂商 Key 以 AES-256-GCM 加密保存在本地保险库，任何接口不回传明文。自定义模型走 OpenAI 兼容
+        chat/completions 协议，模型 id 若与价格目录一致可自动估算成本。
+      </p>
+      <div className={styles.row}>
+        <Button size="sm" variant="primary" onClick={() => setAdding((prev) => !prev)}>
+          {adding ? '收起' : '添加自定义模型'}
+        </Button>
+      </div>
+      {adding && (
+        <div className={styles.keyForm}>
+          <Input value={customId} placeholder="模型 id（API 调用的 model 参数，如 glm-5.2）" onChange={(event) => setCustomId(event.target.value)} />
+          <Input value={customLabel} placeholder="展示名称（如 智谱 GLM-5.2）" onChange={(event) => setCustomLabel(event.target.value)} />
+          <Input value={customBaseUrl} placeholder="API 基址（如 https://open.bigmodel.cn/api/paas/v4）" onChange={(event) => setCustomBaseUrl(event.target.value)} />
+          <div className={styles.row}>
+            <Select value={customLatency} onChange={(event) => setCustomLatency(event.target.value)}>
+              <option value="fast">延迟档位：快</option>
+              <option value="balanced">延迟档位：均衡</option>
+              <option value="slow">延迟档位：慢</option>
+            </Select>
+            <Button size="sm" variant="primary" disabled={!customId.trim() || !customLabel.trim() || !customBaseUrl.trim()} onClick={addCustom}>
+              保存模型
+            </Button>
+          </div>
+        </div>
+      )}
       {models
         .filter((model) => model.provider === 'external')
         .map((model) => (
           <div key={model.id} className={styles.keyRow}>
             <div className={styles.keyInfo}>
               <strong>{model.label}</strong>
+              {model.custom && <span className={styles.keyMissing}>自定义</span>}
               <span className={model.keyConfigured ? styles.keyOk : styles.keyMissing}>
                 {model.keyConfigured ? '已配置' : '未配置'}
               </span>
@@ -424,7 +496,12 @@ function KeysPanel(props: { models: readonly ArenaModelInfo[]; onChanged: () => 
                 <Button size="sm" variant="secondary" onClick={() => setEditing(model.id)}>
                   {model.keyConfigured ? '更换 Key' : '配置 Key'}
                 </Button>
-                {model.keyConfigured && (
+                {model.custom && (
+                  <Button size="sm" variant="danger" onClick={() => removeCustom(model.id)}>
+                    删除模型
+                  </Button>
+                )}
+                {model.keyConfigured && !model.custom && (
                   <Button size="sm" variant="danger" onClick={() => remove(model.id)}>
                     删除
                   </Button>
