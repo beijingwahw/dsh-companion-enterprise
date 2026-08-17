@@ -56,8 +56,6 @@ cd dsh-companion-enterprise
 pnpm install
 pnpm run build
 
-# 注册到 Harness（web profile）
-dsh plugin --profile web add $(pwd)
 ```
 
 ### 启动
