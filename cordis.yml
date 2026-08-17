@@ -1,0 +1,34 @@
+# 开发期热更新进程：npm run dev（独立 cordis + HMR，与 dsh 安装互不影响）。
+# dsh 加载本包时只读 cordis.patch.yml（package.json 的 dsh.bundle.patch），不读此文件。
+# 保存 src/ 下任意文件或本文件本身 → 旧实例卸载（effect 回卷）→ 新代码挂载，无需重启。
+# src/client/**（react/DOM 浏览器 bundle）不进 node HMR 进程：另开 `pnpm build:watch`，
+# 保存任意 client 模块即自动重建 lib/client/**，浏览器重新加载即可。
+# config 与 cordis.patch.yml 逐键一致：开发行为 = 生产 bundle 行为。
+- id: logger
+  name: '@deepseek-ai/cordis-plugin-logger-console'
+- id: timer          # HMR 去抖依赖 timer 服务，缺失则 HMR 永远 PENDING
+  name: '@deepseek-ai/cordis-plugin-timer'
+- id: hmr
+  name: '@deepseek-ai/cordis-plugin-hmr'
+  config:
+    root: ['.']      # 监视仓库目录（默认忽略 node_modules / .* / cache / data）
+    usePolling: true # 沙箱/容器文件系统常缺 inotify 事件，按上游 app-boot 用法走轮询（Config extends ChokidarOptions）
+- id: host-stubs
+  name: './dev/host-stubs.ts'
+- id: companion
+  name: './src/index.ts'
+  config:
+    # 十个功能模块可独立启停，互不影响（与 cordis.patch.yml 逐键一致）
+    enableExport: true
+    enableHandoff: true
+    enableCost: true
+    enableSearch: true
+    enableTrace: true
+    enablePrompt: true
+    enableArena: true
+    enableOrchestrator: true
+    enableTeam: true
+    enableSecurity: true
+    # DeepSeek 官方 API（manifest.json 已全量放行各厂商与中转网关域名）
+    apiBaseUrl: 'https://api.deepseek.com'
+    apiTimeoutMs: 60000
