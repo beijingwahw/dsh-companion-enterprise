@@ -15,7 +15,7 @@
     usePolling: true # 沙箱/容器文件系统常缺 inotify 事件，按上游 app-boot 用法走轮询（Config extends ChokidarOptions）
 - id: host-stubs
   name: './dev/host-stubs.ts'
-- id: companion
+- id: companion-enterprise
   name: './src/index.ts'
   config:
     # 十个功能模块可独立启停，互不影响（与 cordis.patch.yml 逐键一致）

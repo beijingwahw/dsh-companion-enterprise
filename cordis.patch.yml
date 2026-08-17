@@ -3,7 +3,7 @@
 # 每个功能模块在此独立成行：注释掉某行（或加 disabled: true）即可整体停用它。
 
 - insert:
-    - id: companion
+    - id: companion-enterprise
       name: dsh-companion-enterprise
       config:
         # 十个功能模块可独立启停，互不影响
