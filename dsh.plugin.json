@@ -1,0 +1,77 @@
+{
+  "id": "dsh-companion-enterprise",
+  "name": "DeepSeek Companion Enterprise",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 企业级伴侣插件：安全审计与 DLP、团队协作与知识管理、任务编排、多模型竞技场、执行轨迹分析、Prompt 工程工作台、API 成本治理。",
+  "author": "beijingwahw",
+  "license": "MIT",
+  "homepage": "https://github.com/beijingwahw/dsh-companion-enterprise",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beijingwahw/dsh-companion-enterprise.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "companion",
+    "enterprise",
+    "security",
+    "dlp",
+    "orchestrator",
+    "arena",
+    "prompt",
+    "cost"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "entry": {
+    "host": "lib/index.js",
+    "client": "lib/client/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/client/index.d.ts",
+      "default": "./lib/client/index.js"
+    }
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "cordis.patch.yml",
+    "manifest.json",
+    "dsh.plugin.json"
+  ],
+  "bundle": {
+    "patch": "./cordis.patch.yml"
+  },
+  "client": {
+    "platform": "web",
+    "inject": [
+      "@deepseek-ai/dsh-client-runtime",
+      "@deepseek-ai/dsh-client-ui-conversation",
+      "@deepseek-ai/dsh-client-ui-primitives",
+      "@deepseek-ai/dsh-client-locale"
+    ]
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-storage-domain": ">=0.0.1-0",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-storage-domain": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  }
+}

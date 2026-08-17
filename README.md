@@ -45,28 +45,22 @@
 
 ### 前置要求
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) `>= 0.1.0`
-- Node.js `>= 18`
+- Node.js `^22.19 || >=24`
 - pnpm（`npm install -g pnpm`）
 
-将本仓库放入 DeepSeek Harness 的插件目录（或通过包管理器安装），Harness 会依据 dsh.plugin.json 与 cordis.patch.yml 自动加载。
-
-### 从源码安装
+### 一键安装
 
 ```bash
-git clone https://github.com/beijingwahw/dsh-companion-enterprise.git
-cd dsh-companion-enterprise
-pnpm install
-pnpm run build
-
+dsh plugin add beijingwahw/dsh-companion-enterprise --profile web
 ```
 
-### 启动
+启动后插件面板自动加载：
 
 ```bash
 dsh web
 ```
 
-插件面板将在 Harness Web UI 中自动加载。
+> 常用进阶命令：升级 `dsh plugin upgrade dsh-companion-enterprise --profile web`；卸载 `dsh plugin remove dsh-companion-enterprise --profile web`；本地路径安装 `dsh plugin add ./dsh-companion-enterprise --profile web`。
 
 ---
 
@@ -100,9 +94,20 @@ dsh web
 ## 开发
 
 ```bash
-npm install          # 安装依赖
-npm run build        # 编译 TypeScript
-npm run typecheck    # 类型检查
+pnpm install          # 安装依赖
+pnpm run build        # 编译 TypeScript
+pnpm run typecheck    # 类型检查
+pnpm run dev          # 本地 HMR 开发
+```
+
+### 从源码构建安装（贡献者 / 离线场景）
+
+```bash
+git clone https://github.com/beijingwahw/dsh-companion-enterprise.git
+cd dsh-companion-enterprise
+pnpm install
+pnpm run build
+dsh plugin add . --profile web
 ```
 
 ### 项目结构
