@@ -6,6 +6,8 @@
 [![dsh-plugin](https://img.shields.io/badge/dsh-plugin-blue)](https://github.com/topics/dsh-plugin)
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek-Harness-orange)](https://github.com/deepseek-ai/deepseek-harness)
 
+[English](README.en.md) | 中文
+
 **DeepSeek Companion Enterprise** 是构建于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 之上的企业级伴侣插件，为开发团队提供从**安全合规**到**协作效率**的完整能力矩阵。所有数据仅存于本地 Harness 沙箱，零遥测、零追踪。
 
 ---
