@@ -13,12 +13,24 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { ChatMessage } from '../../core/deepseek.js'
-import { HttpError, sendJson } from '../../core/http.js'
+import { HttpError, clampIntParam, sendJson } from '../../core/http.js'
 import { SessionId } from '../../core/ids.js'
 import { formatTranscript, transcriptFromLog } from '../../core/transcript.js'
 import type { SessionLogSnapshot } from '../../types/harness.js'
 import { ArmedStore } from './armed.js'
+import { DEFAULT_CHAR_BUDGET, DEFAULT_RECENT_TURNS, distillContext } from './distill.js'
+import { assessReadiness } from './readiness.js'
+import { generateAcceptanceTests, gradeAcceptance } from './accept.js'
 import { buildHandoffPrompt, buildHandoffPromptWithTemplate } from './prompt.js'
+import {
+  assembleStructuredHandoff,
+  buildStructuredHandoffPrompt,
+  LINEAGE_DEPTH_WARN_THRESHOLD,
+  LINEAGE_MARKER_PATTERN,
+  LineageStore,
+  renderStructuredForInjection,
+  type StructuredHandoff,
+} from './structured.js'
 import { TemplateStore } from './templates.js'
 
 /** 插件名（Cordis fiber 诊断名）。 */
@@ -47,12 +59,15 @@ export function apply(ctx: Context): void {
   // 存储域异步打开：就绪后创建两个存储实例。armed 另持同步引用，
   // 因为系统提示词装配回调是同步的，无法 await。
   let armed: ArmedStore | undefined
+  let lineage: LineageStore | undefined
   const storesReady = ctx.companion.ready.then(({ domain }) => {
     const stores = {
       templates: new TemplateStore(domain),
       armed: new ArmedStore(domain),
+      lineage: new LineageStore(domain),
     }
     armed = stores.armed
+    lineage = stores.lineage
     return stores
   })
   // 兜底 catch：存储域失败且尚无请求 await 时避免未处理 rejection
@@ -104,6 +119,16 @@ export function apply(ctx: Context): void {
               .then((summary) => {
                 if (summary !== undefined) {
                   void store.writeReceipt(scopeText).catch(() => undefined)
+                  // 结构化交接的投递轨迹回写：注入文本首部携带世系标记
+                  // （【世系 hd_xxx】），解析成功则把目标会话记入世系链——
+                  // 下一次从该会话生成交接时即可自动识别父代。旧式自由
+                  // 文本摘要无标记，解析失败静默跳过（完全向后兼容）。
+                  if (lineage) {
+                    const marker = LINEAGE_MARKER_PATTERN.exec(summary)
+                    if (marker) {
+                      void lineage.markDelivered(marker[1], scopeText).catch(() => undefined)
+                    }
+                  }
                 }
               })
               .catch(() => undefined)
@@ -190,6 +215,90 @@ export function apply(ctx: Context): void {
   }
 
   // ------------------------------------------------------------------
+  // 结构化分级交接（创新扩展）：四级分层 + 锚定强制继承 + 世系链
+  // ------------------------------------------------------------------
+
+  /** 结构化交接生成结果。 */
+  interface StructuredHandoffResult {
+    handoff: StructuredHandoff
+    /** 守门自动补回的父代锚定数（保真性指标）。 */
+    autoRestoredCount: number
+    /** 深度告警：交接代数超过阈值时为 true。 */
+    depthWarning: boolean
+    /** 注入渲染文本（武装时使用的正是这份）。 */
+    rendered: string
+  }
+
+  /**
+   * 生成结构化分级交接：读会话 → 找父代（注入到该会话的最近一次交接）
+   * → 元提示（含父代锚定项处置指令）→ 模型输出 JSON → 解析收窄 →
+   * 锚定继承守门 → 世系记录落库。
+   */
+  async function generateStructured(sessionId: SessionId): Promise<StructuredHandoffResult> {
+    let snapshot: SessionLogSnapshot
+    try {
+      snapshot = await ctx.sessionQuery.readSession(sessionId)
+    } catch (error) {
+      throw new HttpError(
+        `读取会话失败：${error instanceof Error ? error.message : String(error)}`,
+        404,
+      )
+    }
+    const conversation = truncateTranscript(
+      formatTranscript(transcriptFromLog(snapshot), { timestamps: false }),
+    )
+    if (!conversation.trim()) {
+      throw new HttpError('会话中没有可摘要的对话内容', 400)
+    }
+
+    const stores = await storesReady
+    // 父代 = 注入到该会话的最近一次结构化交接（无则初代）。
+    const parent = stores.lineage.findLatestDeliveredTo(String(sessionId)) ?? null
+
+    const messages: readonly ChatMessage[] = [
+      { role: 'user', content: buildStructuredHandoffPrompt(conversation, parent) },
+    ]
+    // 结构化交接是模型侧结构化生成任务：优先经成本策略层路由
+    // （taskHint '结构化交接'），否则直连核心服务。
+    let content: string
+    const costGateway = ctx.get('companionCost')
+    if (costGateway) {
+      const result = await costGateway.call({
+        messages,
+        taskHint: '结构化交接',
+        source: 'handoff',
+        priority: 'high',
+      })
+      content = result.content
+    } else {
+      const result = await ctx.companion.callDeepSeek({
+        messages,
+        model: 'deepseek-chat',
+        source: 'handoff',
+      })
+      content = result.content
+    }
+
+    let handoff: StructuredHandoff
+    let autoRestoredCount: number
+    try {
+      ;({ handoff, autoRestoredCount } = assembleStructuredHandoff(content, parent, String(sessionId)))
+    } catch (error) {
+      throw new HttpError(
+        `结构化交接解析失败：${error instanceof Error ? error.message : String(error)}`,
+        502,
+      )
+    }
+    await stores.lineage.save(handoff)
+    return {
+      handoff,
+      autoRestoredCount,
+      depthWarning: handoff.depth + 1 > LINEAGE_DEPTH_WARN_THRESHOLD,
+      rendered: renderStructuredForInjection(handoff),
+    }
+  }
+
+  // ------------------------------------------------------------------
   // HTTP 端点（经 ctx.companion.http 挂载；注册即 effect）
   // ------------------------------------------------------------------
 
@@ -203,6 +312,204 @@ export function apply(ctx: Context): void {
         sendJson(res, 200, await generate(sessionId, templateName))
       }),
     'companion.handoff-http-generate',
+  )
+
+  // ------------------------------------------------------------------
+  // 结构化分级交接端点（创新扩展）
+  // ------------------------------------------------------------------
+
+  /**
+   * 生成结构化分级交接：四级信息分层 + 锚定强制继承守门 + 世系链落库。
+   * 可选 arm: 'pending' 时把渲染文本武装给下一个新对话（经世代门闩）。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('POST', '/handoff/structured', async (_req, res, { body }) => {
+        const record = readObject(body)
+        const sessionId = SessionId(requireString(record.sessionId, 'sessionId'))
+        const arm = record.arm === 'pending' ? 'pending' : 'none'
+        const result = await generateStructured(sessionId)
+        if (arm === 'pending') {
+          await armPending(result.rendered)
+        }
+        sendJson(res, 200, {
+          handoff: result.handoff,
+          autoRestoredCount: result.autoRestoredCount,
+          depthWarning: result.depthWarning,
+          depthWarnThreshold: LINEAGE_DEPTH_WARN_THRESHOLD,
+          rendered: result.rendered,
+          armed: arm === 'pending',
+        })
+      }),
+    'companion.handoff-http-structured-generate',
+  )
+
+  /**
+   * 渐进式上下文蒸馏（创新扩展）：近端原文 + 远端事实压缩，
+   * 零模型调用、确定性、即时完成。可选 arm: 'pending' 把蒸馏产物
+   * 武装给下一个新对话（经世代门闩）。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('POST', '/handoff/distill', async (_req, res, { body }) => {
+        const record = readObject(body)
+        const sessionId = SessionId(requireString(record.sessionId, 'sessionId'))
+        let snapshot: SessionLogSnapshot
+        try {
+          snapshot = await ctx.sessionQuery.readSession(sessionId)
+        } catch (error) {
+          throw new HttpError(
+            `读取会话失败：${error instanceof Error ? error.message : String(error)}`,
+            404,
+          )
+        }
+        const turns = transcriptFromLog(snapshot)
+        if (turns.length === 0) throw new HttpError('会话中没有可蒸馏的对话内容', 400)
+        const recentTurns = clampIntParam(
+          record.recentTurns,
+          1,
+          40,
+          DEFAULT_RECENT_TURNS,
+        )
+        const charBudget = clampIntParam(
+          record.charBudget,
+          1_000,
+          60_000,
+          DEFAULT_CHAR_BUDGET,
+        )
+        const distilled = distillContext(turns, { recentTurns, charBudget })
+        const arm = record.arm === 'pending' ? 'pending' : 'none'
+        if (arm === 'pending') {
+          await armPending(distilled.rendered)
+        }
+        sendJson(res, 200, {
+          rendered: distilled.rendered,
+          facts: distilled.facts,
+          stats: distilled.stats,
+          armed: arm === 'pending',
+        })
+      }),
+    'companion.handoff-http-distill',
+  )
+
+  /** 世系链总览：全部结构化交接的摘要视图（按创建时间降序）。 */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('GET', '/handoff/lineage', async (_req, res) => {
+        const stores = await storesReady
+        sendJson(res, 200, { handoffs: stores.lineage.listSummaries() })
+      }),
+    'companion.handoff-http-lineage-list',
+  )
+
+  /**
+   * 就绪度门（创新扩展）：交接投递前的六维检查单评估。
+   * 不带 handoffId 时评估最近一次结构化交接。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('GET', '/handoff/readiness', async (_req, res, hctx) => {
+        const stores = await storesReady
+        const handoffId = hctx.query.get('handoffId')?.trim() ?? ''
+        const handoff = handoffId
+          ? stores.lineage.get(handoffId)
+          : stores.lineage.listSummaries()[0] !== undefined
+            ? stores.lineage.get(stores.lineage.listSummaries()[0].handoffId)
+            : undefined
+        if (!handoff) {
+          throw new HttpError(
+            handoffId ? `交接 ${handoffId} 不存在` : '尚无任何结构化交接可评估',
+            404,
+          )
+        }
+        sendJson(res, 200, assessReadiness(handoff))
+      }),
+    'companion.handoff-http-readiness',
+  )
+
+  /**
+   * 交接验收测试（创新扩展）：从结构化交接自动生成验收卷
+   * （硬约束/参考定位/开放问题/起步行动四类题 + 关键词评分口径）。
+   * 不带 handoffId 时使用最近一次结构化交接。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('GET', '/handoff/acceptance', async (_req, res, hctx) => {
+        const stores = await storesReady
+        const handoffId = hctx.query.get('handoffId')?.trim() ?? ''
+        const handoff = handoffId
+          ? stores.lineage.get(handoffId)
+          : stores.lineage.listSummaries()[0] !== undefined
+            ? stores.lineage.get(stores.lineage.listSummaries()[0].handoffId)
+            : undefined
+        if (!handoff) {
+          throw new HttpError(
+            handoffId ? `交接 ${handoffId} 不存在` : '尚无任何结构化交接可出卷',
+            404,
+          )
+        }
+        sendJson(res, 200, generateAcceptanceTests(handoff))
+      }),
+    'companion.handoff-http-acceptance-generate',
+  )
+
+  /**
+   * 验收评分：卷面按存储的交接确定性重建（题号稳定），
+   * 答案只需提交 {questionId, answer} 数组。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('POST', '/handoff/acceptance/grade', async (_req, res, { body }) => {
+        const record = readObject(body)
+        const handoffId = requireString(record.handoffId, 'handoffId')
+        const stores = await storesReady
+        const handoff = stores.lineage.get(handoffId)
+        if (!handoff) throw new HttpError(`交接 ${handoffId} 不存在`, 404)
+        const rawAnswers = record.answers
+        if (!Array.isArray(rawAnswers)) throw new HttpError('answers 必须是数组', 400)
+        const answers = rawAnswers.map((raw, index) => {
+          if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+            throw new HttpError(`answers[${index}] 必须是对象`, 400)
+          }
+          const entry = raw as Record<string, unknown>
+          return {
+            questionId: requireString(entry.questionId, `answers[${index}].questionId`),
+            answer: typeof entry.answer === 'string' ? entry.answer : '',
+          }
+        })
+        sendJson(res, 200, gradeAcceptance(generateAcceptanceTests(handoff), answers))
+      }),
+    'companion.handoff-http-acceptance-grade',
+  )
+
+  /**
+   * 世系溯源：从指定交接沿 parent 链向上追到根（含各代锚定约束与
+   * 处置记录——能直接回答"这条约束是第几代定的、中间废弃过什么"）。
+   */
+  ctx.effect(
+    () =>
+      ctx.companion.http.add('GET', '/handoff/lineage/trace', async (_req, res, hctx) => {
+        const handoffId = hctx.query.get('handoffId')?.trim() ?? ''
+        if (handoffId.length === 0) throw new HttpError('handoffId 必填', 400)
+        const stores = await storesReady
+        const { chain, truncated } = stores.lineage.trace(handoffId)
+        if (chain.length === 0) throw new HttpError(`交接 ${handoffId} 不存在`, 404)
+        sendJson(res, 200, {
+          handoffId,
+          depth: chain[0]?.depth ?? 0,
+          chain: chain.map((h) => ({
+            handoffId: h.handoffId,
+            parentHandoffId: h.parentHandoffId,
+            sourceSessionId: h.sourceSessionId,
+            createdAt: h.createdAt,
+            depth: h.depth,
+            anchors: h.tiers.anchors,
+            dispositions: h.dispositions,
+          })),
+          truncated,
+        })
+      }),
+    'companion.handoff-http-lineage-trace',
   )
 
   ctx.effect(
@@ -314,6 +621,40 @@ export function apply(ctx: Context): void {
   ctx.effect(
     () =>
       ctx.commands.register({
+        name: 'handoff-structured',
+        description: '生成结构化分级交接（锚定约束强制继承 + 世系链），并武装给下一个新对话',
+        input: { hint: '会话 ID（缺省使用当前会话）' },
+        handler: async (invocation) => {
+          const target = invocation.rawInput.trim() || invocation.agent.id
+          if (!target) {
+            return { kind: 'error', text: '未指定会话：请提供会话 ID 或在会话内调用' }
+          }
+          try {
+            const result = await generateStructured(SessionId(target))
+            await armPending(result.rendered)
+            const lines = [
+              result.rendered,
+              '',
+              `—— 世系：${result.handoff.handoffId}（第 ${result.handoff.depth + 1} 代，父代 ${
+                result.handoff.parentHandoffId ?? '无（初代）'
+              }）；守门补回锚定 ${result.autoRestoredCount} 条`,
+            ]
+            if (result.depthWarning) {
+              lines.push(`⚠ 上下文已传承 ${result.handoff.depth + 1} 代，建议回读源头会话核实关键决策`)
+            }
+            lines.push('已武装：将注入下一个新对话的系统提示词（24 小时内有效）。')
+            return { kind: 'success', text: lines.join('\n') }
+          } catch (error) {
+            return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
+          }
+        },
+      }),
+    'companion.handoff-structured-command',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.commands.register({
         name: 'handoff-import',
         description: '导入交接摘要（输入为摘要全文），武装给下一个新对话',
         input: { hint: '交接摘要全文' },
@@ -363,6 +704,8 @@ function optionalString(value: unknown, field: string): string | undefined {
   const trimmed = value.trim()
   return trimmed ? trimmed : undefined
 }
+
+// clampInt 已上移 core/http.ts（clampIntParam，全插件唯一权威实现）。
 
 /** 将摘要渲染为注入系统提示词的段落。 */
 function renderHandoffSection(summary: string): string {

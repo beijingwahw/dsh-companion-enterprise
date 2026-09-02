@@ -11,6 +11,7 @@
  * MAX_RULE_PATTERN_LENGTH；运行期正则经 ModelRouter 内部缓存预编译复用，
  * 不在热路径重复 new RegExp。
  */
+import type { TaskClass } from './adaptive.js';
 import type { CostCustomRule, CostSettings } from './settings.js';
 /** 自定义路由规则数量上限（保存入口校验）。 */
 export declare const MAX_CUSTOM_RULES = 20;
@@ -22,6 +23,8 @@ export interface RouteDecision {
     model: string;
     /** 判定原因（供日志与诊断展示）。 */
     reason: string;
+    /** 判定来源：custom-rule=用户显式规则（自适应路由不接管）；keyword/default=可学习。 */
+    source: 'custom-rule' | 'keyword' | 'default';
 }
 /** 携带预编译正则的路由规则对象。 */
 export interface CompiledCustomRule {
@@ -46,6 +49,12 @@ export declare class ModelRouter {
      * @returns 模型与判定原因。
      */
     resolve(taskHint: string | undefined, settings: CostSettings): RouteDecision;
+    /**
+     * 任务难度分类（自适应路由的学习维度）：复杂类关键词命中 → 'complex'，
+     * 否则 'simple'。与 resolve() 的关键词启发式同源，保证两套路由
+     * 对同一 taskHint 的难度判定一致。
+     */
+    classify(taskHint: string | undefined): TaskClass;
     /**
      * pattern 是否命中 hint：先大小写不敏感子串匹配，
      * 再用缓存的预编译正则（大小写不敏感）匹配；非法正则视为未命中

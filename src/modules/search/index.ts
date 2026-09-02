@@ -2,19 +2,44 @@
  * 模块 D：全局对话检索插件。
  *
  * 经 ctx.companion.http 注册 GET /search、GET /tags、POST /tags，
- * 经 ctx.commands 注册 `search` 与 `tag` 命令；检索逻辑复用
- * ./service.js，标签数据落在 companion 存储域 'tags' 表（./tags.js）。
+ * GET /search/semantic（语义邻域检索：PRF 查询扩展 + RRF 融合）、
+ * GET /search/similar（相似会话 more-like-this）、
+ * GET /search/graph 与 GET /search/graph/entity（组织记忆图谱：
+ * 实体抽取 + 共现构图 + PageRank 枢纽），
+ * POST /search/rerank（点击反馈学习重排序：IPW 去位置偏 + 词元泛化，
+ * 展示即记录曝光）、POST /search/click（记录点击）、
+ * GET /search/clicks/stats（点击模型面板），
+ * POST /search/diversify（MMR 多样性重排：λ 权衡相关性与冗余 + 去重审计），
+ * 经 ctx.commands 注册 `search`、`similar` 与 `tag` 命令；检索逻辑复用
+ * ./service.js 与 ./neighborhood.js，标签数据落在 companion 存储域
+ * 'tags' 表（./tags.js），点击事件落在 'search-clicks' 表（./rerank.js）。
  *
  * apply 是同步函数，而存储域打开是异步的：内部用 void async IIFE
  * 先 await ctx.companion.ready 取 domain 建 TagStore，再把全部注册
  * 动作放进 ctx.effect，保证随插件卸载回卷。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { HttpError, sendJson } from '../../core/http.js'
+import { HttpError, sendJson, toSafeHttpError } from '../../core/http.js'
 import { SessionId } from '../../core/ids.js'
 import { formatBeijingTime } from '../../core/time.js'
 import type { CommandInvocation, CommandResult } from '../../types/harness.js'
+import { semanticSearch, SessionIndex, similarSessions } from './neighborhood.js'
+import {
+  buildMemoryGraph,
+  collectGraphSessions,
+  entityNeighborhood,
+  graphReport,
+} from './graph.js'
 import { searchSessions, type SearchParams } from './service.js'
+import {
+  ClickFeedbackStore,
+  clickModelStats,
+  clickScore,
+  DEFAULT_CLICK_WEIGHT,
+  learnClickModel,
+  rerankHits,
+} from './rerank.js'
+import { diversifyHits } from './diversify.js'
 import { TagStore } from './tags.js'
 
 /** 插件名。 */
@@ -29,6 +54,9 @@ const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 /** 一日毫秒数。 */
 const DAY_MS = 24 * 60 * 60 * 1000
 
+/** 记忆图谱缓存 TTL（毫秒）。 */
+const GRAPH_TTL_MS = 60_000
+
 /** YYYY-MM-DD 日期模式。 */
 const DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/
 
@@ -39,6 +67,18 @@ export function apply(ctx: Context): void {
     const store = await ctx.companion.ready.catch(() => undefined)
     if (!store) return
     const tagStore = new TagStore(store.domain)
+    const clickStore = new ClickFeedbackStore(store.domain)
+    // 语义邻域索引（内存缓存 + TTL 重建，见 neighborhood.ts）。
+    const neighborhoodIndex = new SessionIndex(ctx.sessionQuery)
+    // 组织记忆图谱缓存（TTL 内复用，避免每次查询全量重扫会话）。
+    let graphCache: { at: number; graph: ReturnType<typeof buildMemoryGraph> } | undefined
+    const ensureGraph = async (): Promise<ReturnType<typeof buildMemoryGraph>> => {
+      if (graphCache && Date.now() - graphCache.at < GRAPH_TTL_MS) return graphCache.graph
+      const corpus = await collectGraphSessions(ctx.sessionQuery)
+      const graph = buildMemoryGraph(corpus)
+      graphCache = { at: Date.now(), graph }
+      return graph
+    }
 
     try {
       ctx.effect(() => {
@@ -55,6 +95,151 @@ export function apply(ctx: Context): void {
             } catch (error) {
               throw toSafeHttpError(error, '检索会话失败')
             }
+          }),
+
+          // 语义邻域检索：PRF 查询扩展 + 多源 RRF 融合（创新扩展）。
+          ctx.companion.http.add('GET', '/search/semantic', async (_req, res, hctx) => {
+            try {
+              const query = hctx.query.get('query')?.trim() ?? ''
+              if (query.length === 0) throw new HttpError('query 必填', 400)
+              const limit = parseLimitParam(hctx.query.get('limit'))
+              const result = await semanticSearch(
+                { sessionQuery: ctx.sessionQuery, tagStore },
+                neighborhoodIndex,
+                query,
+                limit,
+              )
+              sendJson(res, 200, result)
+            } catch (error) {
+              throw toSafeHttpError(error, '语义检索失败')
+            }
+          }),
+
+          // 相似会话（more-like-this）：找出与指定会话内容最像的历史会话。
+          ctx.companion.http.add('GET', '/search/similar', async (_req, res, hctx) => {
+            try {
+              const sessionId = hctx.query.get('sessionId')?.trim() ?? ''
+              if (sessionId.length === 0) throw new HttpError('sessionId 必填', 400)
+              const limit = parseLimitParam(hctx.query.get('limit'))
+              const result = await similarSessions(
+                { sessionQuery: ctx.sessionQuery, tagStore },
+                neighborhoodIndex,
+                sessionId,
+                limit,
+              )
+              sendJson(res, 200, result)
+            } catch (error) {
+              throw toSafeHttpError(error, '查找相似会话失败')
+            }
+          }),
+
+          // 组织记忆图谱：整体报告（PageRank 枢纽，创新扩展）。
+          ctx.companion.http.add('GET', '/search/graph', async (_req, res) => {
+            try {
+              const graph = await ensureGraph()
+              sendJson(res, 200, graphReport(graph))
+            } catch (error) {
+              throw toSafeHttpError(error, '构建记忆图谱失败')
+            }
+          }),
+
+          // 组织记忆图谱：实体邻域查询（关联实体 + 关联会话）。
+          ctx.companion.http.add('GET', '/search/graph/entity', async (_req, res, hctx) => {
+            try {
+              const name = hctx.query.get('name')?.trim() ?? ''
+              if (name.length === 0) throw new HttpError('name 必填', 400)
+              const graph = await ensureGraph()
+              const neighborhood = entityNeighborhood(graph, name)
+              if (!neighborhood) throw new HttpError(`实体「${name}」不在图谱中`, 404)
+              sendJson(res, 200, neighborhood)
+            } catch (error) {
+              throw toSafeHttpError(error, '查询实体邻域失败')
+            }
+          }),
+
+          // 点击反馈学习重排序（创新扩展）：检索 → 点击模型重排 →
+          // 展示即记录曝光（下次学习的燃料）。
+          ctx.companion.http.add('POST', '/search/rerank', async (_req, res, hctx) => {
+            try {
+              const body = parseRerankBody(hctx.body)
+              const hits = await searchSessions(
+                { sessionQuery: ctx.sessionQuery, tagStore },
+                {
+                  query: body.query,
+                  ...(body.from !== undefined ? { from: body.from } : {}),
+                  ...(body.to !== undefined ? { to: body.to } : {}),
+                  ...(body.tags !== undefined && body.tags.length > 0 ? { tags: body.tags } : {}),
+                  limit: body.limit,
+                },
+              )
+              const model = learnClickModel(clickStore.events())
+              const report = rerankHits(hits, model, body.query, body.clickWeight)
+              // 展示即曝光：记录本次位次序列，供去偏学习。
+              await clickStore.recordImpression(
+                body.query,
+                report.entries.map((entry) => entry.session.id),
+              )
+              sendJson(res, 200, report)
+            } catch (error) {
+              throw toSafeHttpError(error, '点击反馈重排失败')
+            }
+          }),
+
+          // MMR 多样性重排（创新扩展）：检索结果去冗余，λ 权衡相关性与多样性。
+          // POST /search/diversify {query, from?, to?, tags?, limit?, lambda?}。
+          ctx.companion.http.add('POST', '/search/diversify', async (_req, res, hctx) => {
+            try {
+              const body = parseRerankBody(hctx.body)
+              const lambdaRaw =
+                typeof hctx.body === 'object' && hctx.body !== null && !Array.isArray(hctx.body)
+                  ? Number((hctx.body as Record<string, unknown>).lambda)
+                  : Number.NaN
+              const lambda =
+                Number.isFinite(lambdaRaw) && lambdaRaw >= 0 && lambdaRaw <= 1 ? lambdaRaw : undefined
+              const hits = await searchSessions(
+                { sessionQuery: ctx.sessionQuery, tagStore },
+                {
+                  query: body.query,
+                  ...(body.from !== undefined ? { from: body.from } : {}),
+                  ...(body.to !== undefined ? { to: body.to } : {}),
+                  ...(body.tags !== undefined && body.tags.length > 0 ? { tags: body.tags } : {}),
+                  limit: body.limit,
+                },
+              )
+              sendJson(
+                res,
+                200,
+                diversifyHits(hits, body.query, {
+                  ...(lambda !== undefined ? { lambda } : {}),
+                  limit: body.limit,
+                }),
+              )
+            } catch (error) {
+              throw toSafeHttpError(error, 'MMR 多样性重排失败')
+            }
+          }),
+
+          // 记录一次点击（query + 会话 + 位次；位次从 1 起）。
+          ctx.companion.http.add('POST', '/search/click', async (_req, res, hctx) => {
+            try {
+              const body = parseClickBody(hctx.body)
+              await clickStore.recordClick(body.query, body.sessionId, body.position)
+              const model = learnClickModel(clickStore.events())
+              sendJson(res, 200, {
+                ok: true,
+                ...(model.eventCount > 0
+                  ? { clickSignal: clickScore(model, body.query, body.sessionId) }
+                  : {}),
+              })
+            } catch (error) {
+              throw toSafeHttpError(error, '记录点击失败')
+            }
+          }),
+
+          // 点击模型面板：事件量/全局率/词表/最强会话信号。
+          ctx.companion.http.add('GET', '/search/clicks/stats', (_req, res) => {
+            const model = learnClickModel(clickStore.events())
+            sendJson(res, 200, clickModelStats(model))
           }),
 
           // 标签读取：带 sessionId 返回单会话标签，缺省返回全量映射。
@@ -215,6 +400,25 @@ function parseSearchParams(query: URLSearchParams): SearchParams {
   return params
 }
 
+/** 语义检索/相似会话的缺省返回条数。 */
+const DEFAULT_SEMANTIC_LIMIT = 10
+
+/** 语义检索/相似会话的返回条数上限。 */
+const MAX_SEMANTIC_LIMIT = 50
+
+/**
+ * 解析语义检索/相似会话端点的 limit 参数：
+ * 缺省取 DEFAULT_SEMANTIC_LIMIT；必须是 1..MAX 的整数，否则 400。
+ */
+function parseLimitParam(value: string | null): number {
+  if (value === null || value.trim().length === 0) return DEFAULT_SEMANTIC_LIMIT
+  const parsed = Number(value.trim())
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_SEMANTIC_LIMIT) {
+    throw new HttpError(`limit 必须是 1-${MAX_SEMANTIC_LIMIT} 的整数`)
+  }
+  return parsed
+}
+
 /** 解析 POST /tags 请求体。 */
 function parseTagsBody(body: unknown): {
   sessionId: SessionId
@@ -235,6 +439,72 @@ function parseTagsBody(body: unknown): {
   }
 }
 
+/** 解析 POST /search/rerank 请求体。 */
+function parseRerankBody(body: unknown): {
+  query: string
+  from?: number
+  to?: number
+  tags?: string[]
+  limit: number
+  clickWeight: number
+} {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new HttpError('请求体必须是 JSON 对象')
+  }
+  const record = body as Record<string, unknown>
+  const query = typeof record.query === 'string' ? record.query.trim() : ''
+  if (query.length === 0) throw new HttpError('query 必填')
+  const from = record.from !== undefined ? parseTimeParam(String(record.from), 'start') : undefined
+  const to = record.to !== undefined ? parseTimeParam(String(record.to), 'end') : undefined
+  const tags =
+    typeof record.tags === 'string' && record.tags.trim().length > 0
+      ? record.tags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter((tag) => tag.length > 0)
+      : undefined
+  const limitRaw = record.limit
+  const limit =
+    limitRaw === undefined
+      ? DEFAULT_SEMANTIC_LIMIT
+      : (() => {
+          const parsed = Number(limitRaw)
+          if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_SEMANTIC_LIMIT) {
+            throw new HttpError(`limit 必须是 1-${MAX_SEMANTIC_LIMIT} 的整数`)
+          }
+          return parsed
+        })()
+  const weightRaw = record.clickWeight
+  const clickWeight =
+    weightRaw === undefined
+      ? DEFAULT_CLICK_WEIGHT
+      : (() => {
+          const parsed = Number(weightRaw)
+          if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+            throw new HttpError('clickWeight 必须在 0-1 之间')
+          }
+          return parsed
+        })()
+  return { query, from, to, tags, limit, clickWeight }
+}
+
+/** 解析 POST /search/click 请求体。 */
+function parseClickBody(body: unknown): { query: string; sessionId: string; position: number } {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new HttpError('请求体必须是 JSON 对象')
+  }
+  const record = body as Record<string, unknown>
+  const query = typeof record.query === 'string' ? record.query.trim() : ''
+  if (query.length === 0) throw new HttpError('query 必填')
+  const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : ''
+  if (sessionId.length === 0) throw new HttpError('sessionId 必填')
+  const position = Number(record.position)
+  if (!Number.isInteger(position) || position < 1) {
+    throw new HttpError('position 必须是从 1 起的正整数（点击位次）')
+  }
+  return { query, sessionId, position }
+}
+
 /** 解析可选的标签字符串数组。 */
 function parseTagList(value: unknown, field: string): string[] | undefined {
   if (value === undefined) return undefined
@@ -247,11 +517,4 @@ function parseTagList(value: unknown, field: string): string[] | undefined {
   return tags
 }
 
-/**
- * 将错误收敛为用户安全的 HttpError：
- * HttpError 原样透传；其余错误以通用文案包装，避免泄漏内部细节。
- */
-function toSafeHttpError(error: unknown, fallbackMessage: string): HttpError {
-  if (error instanceof HttpError) return error
-  return new HttpError(fallbackMessage, 500)
-}
+// toSafeHttpError 已上移 core/http.ts（全插件唯一权威实现）。

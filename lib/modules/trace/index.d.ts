@@ -9,7 +9,8 @@
  * - GET    /trace/get             读取单条轨迹（含异常与指标）；
  * - DELETE /trace                 删除已保存轨迹；
  * - POST   /trace/diff            两条轨迹对比（E3），可返回 HTML 对比报告；
- * - GET    /trace/stats           日聚合趋势 + 历史基准线（E4）。
+ * - GET    /trace/stats           日聚合趋势 + 历史基准线（E4）；
+ * - GET    /trace/spc             SPC 统计过程控制（EWMA 控制图 + 漂移检测）。
  *
  * 命令 `trace`：分析指定会话（或最近会话）并输出文本报告。
  */

@@ -7,13 +7,33 @@
  *    POST /prompt/rate、GET /prompt/ratings；
  * F3 模板库：GET/POST/DELETE /prompt/templates、POST /prompt/render（变量插值）、
  *    POST /prompt/codegen（一键生成 Python/Node.js/curl 调用代码）；
- * F4 结构化校验：POST /prompt/validate（批量发送并按 JSON Schema 校验合规率）。
+ * F4 结构化校验：POST /prompt/validate（批量发送并按 JSON Schema 校验合规率）；
+ * F5 自动优化：POST /prompt/optimize（元提示变异 + 配对显著性检验，
+ *    统计显著更优时自动晋升为新版本）；
+ * F7 变体寻优：POST /prompt/bandit（创建 Thompson Sampling 实验）、
+ *    GET /prompt/bandit（实验列表）、GET /prompt/bandit/get（后验分析：
+ *    P(best)/期望损失/95% CI）、POST /prompt/bandit/pull（执行采样轮次）、
+ *    DELETE /prompt/bandit（删除实验）；
+ * F8 静态分析：POST /prompt/lint（矛盾指令/占位符/模糊量词检测 + 复杂度
+ *    度量 + 健康分，零模型调用）。
  *
  * 命令 `prompt`：查看当前 Prompt 版本历史。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { HttpError, sendJson } from '../../core/http.js'
 import type { CommandInvocation, CommandResult } from '../../types/harness.js'
+import { MAX_CANDIDATES, MAX_OPTIMIZE_CASES, optimizePrompt, type OptimizeCase } from './optimize.js'
+import {
+  BanditStore,
+  MAX_BANDIT_ARMS,
+  MAX_BANDIT_CASES,
+  MAX_PULL_ROUNDS,
+  posteriorAnalysis,
+  runBanditPulls,
+  type BanditCase,
+} from './bandit.js'
+import { lintPrompt } from './lint.js'
+import { compilePrompt } from './compiler.js'
 import { extractJsonFromOutput, parseSchema, validateAgainstSchema } from './schema.js'
 import {
   extractTemplateVariables,
@@ -40,6 +60,7 @@ export function apply(ctx: Context): void {
     const versions = new PromptVersionStore(store.domain)
     const templates = new PromptTemplateStore(store.domain)
     const ratings = new PromptRatingStore(store.domain)
+    const bandit = new BanditStore(store.domain)
 
     try {
       ctx.effect(() => {
@@ -255,6 +276,145 @@ export function apply(ctx: Context): void {
           }),
 
           // --------------------------------------------------------------
+          // F5 自动优化：元提示变异 + 配对显著性检验
+          // --------------------------------------------------------------
+          ctx.companion.http.add('POST', '/prompt/optimize', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const prompt = requireString(body.prompt, 'prompt')
+            const cases = parseOptimizeCases(body.cases)
+            if (cases.length < 2) {
+              throw new HttpError('优化至少需要 2 条用例（配对检验需要样本量）', 400)
+            }
+            const model =
+              typeof body.model === 'string' && body.model.trim() ? body.model.trim() : 'deepseek-chat'
+            const candidates =
+              body.candidates === undefined ? 2 : requireInt(body.candidates, 'candidates')
+            if (candidates < 1 || candidates > MAX_CANDIDATES) {
+              throw new HttpError(`candidates 必须在 1~${MAX_CANDIDATES} 之间`, 400)
+            }
+            const save = body.save === false ? false : true
+            const result = await optimizePrompt(ctx, versions, {
+              prompt,
+              cases,
+              model,
+              candidates,
+              save,
+            })
+            sendJson(res, 200, result)
+          }),
+
+          // --------------------------------------------------------------
+          // F6 预算编译器：token 预算内组件级保真裁剪（创新扩展）
+          // --------------------------------------------------------------
+          ctx.companion.http.add('POST', '/prompt/compile', (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const prompt = requireString(body.prompt, 'prompt')
+            const budget = requireInt(body.budgetTokens, 'budgetTokens')
+            if (budget <= 0) throw new HttpError('budgetTokens 必须是正整数', 400)
+            if (budget > 1_000_000) throw new HttpError('budgetTokens 过大（上限 100 万）', 400)
+            sendJson(res, 200, compilePrompt(prompt, budget))
+          }),
+
+          // --------------------------------------------------------------
+          // F7 变体寻优：Thompson Sampling 多臂老虎机（创新扩展）
+          // --------------------------------------------------------------
+          // 创建实验：≥2 个互不相同的变体 + 评测用例集。
+          ctx.companion.http.add('POST', '/prompt/bandit', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : '变体寻优实验'
+            const variants = parseStringArray(body.variants, 'variants')
+            if (variants.length < 2) throw new HttpError('variants 至少需要 2 个变体', 400)
+            if (variants.length > MAX_BANDIT_ARMS) {
+              throw new HttpError(`variants 不能超过 ${MAX_BANDIT_ARMS} 个`, 400)
+            }
+            if (new Set(variants.map((v) => v.trim())).size !== variants.length) {
+              throw new HttpError('variants 存在重复内容', 400)
+            }
+            const cases = parseBanditCases(body.cases)
+            if (cases.length === 0) throw new HttpError('cases 至少需要 1 条用例', 400)
+            const model =
+              typeof body.model === 'string' && body.model.trim() ? body.model.trim() : 'deepseek-chat'
+            const experiment = await bandit.create({ name, model, variants, cases })
+            sendJson(res, 200, { experiment, analysis: posteriorAnalysis(experiment.arms) })
+          }),
+
+          // 实验列表。
+          ctx.companion.http.add('GET', '/prompt/bandit', (_req, res) => {
+            sendJson(res, 200, {
+              experiments: bandit.list().map((experiment) => ({
+                id: experiment.id,
+                name: experiment.name,
+                model: experiment.model,
+                armCount: experiment.arms.length,
+                caseCount: experiment.cases.length,
+                totalPulls: experiment.arms.reduce((sum, arm) => sum + arm.pulls, 0),
+                updatedAt: experiment.updatedAt,
+              })),
+            })
+          }),
+
+          // 后验分析：P(best)/期望损失/95% CI + 停止裁决。
+          ctx.companion.http.add('GET', '/prompt/bandit/get', (_req, res, hctx) => {
+            const id = hctx.query.get('id')?.trim() ?? ''
+            const experiment = bandit.get(id)
+            if (!experiment) throw new HttpError(`实验不存在：${id}`, 404)
+            sendJson(res, 200, { experiment, analysis: posteriorAnalysis(experiment.arms) })
+          }),
+
+          // 执行采样轮次：Thompson 选臂 → 轮转用例 → 后验更新。
+          ctx.companion.http.add('POST', '/prompt/bandit/pull', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const id = requireString(body.id, 'id')
+            const rounds = body.rounds === undefined ? 5 : requireInt(body.rounds, 'rounds')
+            if (rounds > MAX_PULL_ROUNDS) {
+              throw new HttpError(`rounds 单次不能超过 ${MAX_PULL_ROUNDS}`, 400)
+            }
+            try {
+              sendJson(res, 200, await runBanditPulls(ctx, bandit, id, rounds))
+            } catch (error) {
+              throw new HttpError(
+                error instanceof Error ? error.message : '采样执行失败',
+                404,
+              )
+            }
+          }),
+
+          // 删除实验。
+          ctx.companion.http.add('DELETE', '/prompt/bandit', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const id = requireString(body.id, 'id')
+            await bandit.delete(id)
+            sendJson(res, 200, { ok: true })
+          }),
+
+          // --------------------------------------------------------------
+          // F8 Prompt 静态分析（创新扩展）：矛盾指令检测 + 复杂度度量
+          // --------------------------------------------------------------
+          // POST /prompt/lint {text, variables?, budgetTokens?}：
+          // 不发起任何模型调用，纯静态检查 Prompt 的可执行性。
+          ctx.companion.http.add('POST', '/prompt/lint', (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const text = requireString(body.text, 'text')
+            const variables =
+              Array.isArray(body.variables) && body.variables.every((v) => typeof v === 'string')
+                ? (body.variables as string[])
+                : undefined
+            const budgetTokensRaw = Number(body.budgetTokens)
+            const budgetTokens =
+              Number.isFinite(budgetTokensRaw) && budgetTokensRaw > 0
+                ? Math.floor(budgetTokensRaw)
+                : undefined
+            sendJson(
+              res,
+              200,
+              lintPrompt(text, {
+                ...(variables ? { variables } : {}),
+                ...(budgetTokens ? { budgetTokens } : {}),
+              }),
+            )
+          }),
+
+          // --------------------------------------------------------------
           // 命令面板
           // --------------------------------------------------------------
           ctx.commands.register({
@@ -440,6 +600,64 @@ function parseStringArray(value: unknown, field: string): string[] {
     result.push(item)
   }
   return result
+}
+
+/** 解析自动优化用例数组：[{ input, expected? }]（≤ MAX_OPTIMIZE_CASES 条）。 */
+function parseOptimizeCases(value: unknown): OptimizeCase[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new HttpError('cases 必须是非空数组', 400)
+  }
+  if (value.length > MAX_OPTIMIZE_CASES) {
+    throw new HttpError(`优化用例不能超过 ${MAX_OPTIMIZE_CASES} 条`, 400)
+  }
+  const cases: OptimizeCase[] = []
+  for (let index = 0; index < value.length; index += 1) {
+    const raw: unknown = value[index]
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new HttpError(`cases[${index}] 必须是对象`, 400)
+    }
+    const entry = raw as Record<string, unknown>
+    if (typeof entry.input !== 'string' || entry.input.trim().length === 0) {
+      throw new HttpError(`cases[${index}].input 必须是非空字符串`, 400)
+    }
+    if (entry.expected !== undefined && typeof entry.expected !== 'string') {
+      throw new HttpError(`cases[${index}].expected 必须是字符串`, 400)
+    }
+    cases.push({
+      input: entry.input,
+      expected: entry.expected !== undefined ? entry.expected : undefined,
+    })
+  }
+  return cases
+}
+
+/** 解析老虎机用例数组：[{ input, expected? }]（≤ MAX_BANDIT_CASES 条）。 */
+function parseBanditCases(value: unknown): BanditCase[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new HttpError('cases 必须是非空数组', 400)
+  }
+  if (value.length > MAX_BANDIT_CASES) {
+    throw new HttpError(`用例不能超过 ${MAX_BANDIT_CASES} 条`, 400)
+  }
+  const cases: BanditCase[] = []
+  for (let index = 0; index < value.length; index += 1) {
+    const raw: unknown = value[index]
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new HttpError(`cases[${index}] 必须是对象`, 400)
+    }
+    const entry = raw as Record<string, unknown>
+    if (typeof entry.input !== 'string' || entry.input.trim().length === 0) {
+      throw new HttpError(`cases[${index}].input 必须是非空字符串`, 400)
+    }
+    if (entry.expected !== undefined && typeof entry.expected !== 'string') {
+      throw new HttpError(`cases[${index}].expected 必须是字符串`, 400)
+    }
+    cases.push({
+      input: entry.input,
+      expected: entry.expected !== undefined ? entry.expected : undefined,
+    })
+  }
+  return cases
 }
 
 /** 解析变量表（字符串 → 字符串）。 */

@@ -25,6 +25,7 @@ import { round4, tokenUsageToUsageLike } from '../../core/pricing.js'
 import type { CallParams } from '../../core/service.js'
 import { beijingDayKey } from '../../core/time.js'
 import type { DailyUsage } from '../../core/usage.js'
+import { AdaptiveRouter, computeReward, type ArmReport, type TaskClass } from './adaptive.js'
 import { BudgetGuard, type BudgetSnapshot } from './budget.js'
 import { CostEstimator } from './estimator.js'
 import { ModelRouter } from './router.js'
@@ -59,6 +60,10 @@ export interface CostGateway {
   budgetState(): Promise<BudgetSnapshot>
   /** 峰谷调度等待队列快照。 */
   queueSnapshot(): readonly QueuedTaskInfo[]
+  /** 自适应路由面板：两类任务各自的赌臂统计。 */
+  adaptiveReport(): Promise<Record<TaskClass, ArmReport[]>>
+  /** 清空自适应路由学习状态（缺省全部类别）。 */
+  adaptiveReset(cls?: TaskClass): Promise<void>
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -70,6 +75,7 @@ declare module '@deepseek-ai/cordis' {
 /** 成本网关服务实现（经 ctx.plugin 挂载；服务名 companionCost）。 */
 export class CostGatewayService extends Service implements CostGateway {
   private readonly router = new ModelRouter()
+  private readonly adaptive: AdaptiveRouter
   private readonly scheduler: PeakScheduler
   private readonly estimator = new CostEstimator()
   private readonly getSettings: () => CostSettings
@@ -87,6 +93,7 @@ export class CostGatewayService extends Service implements CostGateway {
   ) {
     super(ctx, 'companionCost')
     this.getSettings = getSettings
+    this.adaptive = new AdaptiveRouter(ctx)
     // 接线预算复检回调：drain 执行每个延迟任务前复查预算闸门，
     // 抛错（如预算暂停）即以预算不足错误拒绝执行该任务，队列不构成旁路。
     // 高峰窗口取自计价引擎（官方定价页实时解析），官方调整时段后自动跟随。
@@ -120,9 +127,20 @@ export class CostGatewayService extends Service implements CostGateway {
     await guard.check(params.essential ?? false)
 
     // 模型路由：按任务难易选择模型（关闭时沿用核心服务缺省模型）。
+    // 自适应路由开启时：用户显式规则仍最高优先；其余情形由 UCB1 赌博机
+    // 在 simple/complex 候选集中从真实调用结果学习每类任务的最优模型。
     let model: string | undefined
+    let bandit: { cls: TaskClass; cheapestPrice: number } | undefined
     if (settings.modelRouting) {
-      model = this.router.resolve(params.taskHint, settings).model
+      const decision = this.router.resolve(params.taskHint, settings)
+      if (settings.adaptiveRouting && decision.source !== 'custom-rule') {
+        const cls = this.router.classify(params.taskHint)
+        const candidates = [settings.simpleModel, settings.complexModel]
+        bandit = { cls, cheapestPrice: this.cheapestProxyPrice(candidates) }
+        model = (await this.adaptive.select(cls, candidates)).model
+      } else {
+        model = decision.model
+      }
     }
 
     // 峰谷调度：仅 normal 优先级参与；是否真实延迟由调度器判定并返回
@@ -150,9 +168,18 @@ export class CostGatewayService extends Service implements CostGateway {
         const actualCny = this.actualCostOf(result, requestedModel)
         reservation.settle(actualCny)
         this.estimator.observe(requestedModel, inputChars, actualCny)
+        this.observeAdaptive(bandit, requestedModel, true, result.latencyMs, actualCny)
         return result
       } catch (error) {
         reservation.release()
+        // 失败同样计入赌博机观测（ok=false，时延按超时上界计）。
+        this.observeAdaptive(
+          bandit,
+          requestedModel,
+          false,
+          this.ctx.companion.config.apiTimeoutMs,
+          0,
+        )
         throw error
       }
     }
@@ -189,6 +216,57 @@ export class CostGatewayService extends Service implements CostGateway {
 
   queueSnapshot(): readonly QueuedTaskInfo[] {
     return this.scheduler.queueSnapshot()
+  }
+
+  /** 自适应路由面板：两类任务各自的赌臂统计（均值奖励/UCB/失败率等）。 */
+  adaptiveReport(): Promise<Record<TaskClass, ArmReport[]>> {
+    return this.adaptive.report()
+  }
+
+  /** 清空自适应路由学习状态（缺省全部类别）。 */
+  adaptiveReset(cls?: TaskClass): Promise<void> {
+    return this.adaptive.reset(cls)
+  }
+
+  /**
+   * 自适应路由观测（best-effort）：合成奖励并写入赌博机；
+   * 观测或持久化失败静默，绝不影响调用主流程。
+   */
+  private observeAdaptive(
+    bandit: { cls: TaskClass; cheapestPrice: number } | undefined,
+    model: string,
+    ok: boolean,
+    latencyMs: number,
+    costCny: number,
+  ): void {
+    if (!bandit) return
+    const reward = computeReward(
+      {
+        ok,
+        latencyMs,
+        costCny,
+        cheapestPrice: bandit.cheapestPrice,
+        modelPrice: this.proxyPrice(model),
+      },
+      this.ctx.companion.config.apiTimeoutMs,
+    )
+    void this.adaptive.observe(bandit.cls, model, reward, latencyMs, costCny).catch(() => undefined)
+  }
+
+  /** 候选集最低代理单价（元/百万 tokens）：奖励合成的成本分母。 */
+  private cheapestProxyPrice(candidates: readonly string[]): number {
+    let cheapest = Number.POSITIVE_INFINITY
+    for (const model of candidates) {
+      cheapest = Math.min(cheapest, this.proxyPrice(model))
+    }
+    return Number.isFinite(cheapest) ? cheapest : 0
+  }
+
+  /** 模型代理单价：(输入未命中价 + 输出价) / 2，元/百万 tokens；未知模型取 0（得分兜底 1）。 */
+  private proxyPrice(model: string): number {
+    const price = this.ctx.companion.prices.resolve(model, Date.now())
+    if (!price) return 0
+    return (price.inputMiss + price.output) / 2
   }
 
   /**

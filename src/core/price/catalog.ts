@@ -39,8 +39,14 @@ const VENDOR_PREFIXES: ReadonlyArray<readonly [string, string]> = [
   ['ernie', 'ernie'],
 ]
 
-/** 厂商元信息。 */
-export const VENDORS: Record<string, VendorInfo> = {
+/** 全部厂商 id（与 VENDORS 的键一一对应）。 */
+export const VENDOR_IDS = ['deepseek', 'zhipu', 'moonshot', 'qwen', 'doubao', 'minimax', 'ernie'] as const
+
+/** 厂商 id 的精确类型：以字面量联合取代裸 string，未知厂商无法通过类型检查。 */
+export type VendorId = (typeof VENDOR_IDS)[number]
+
+/** 厂商元信息：键类型精确到 VendorId，"deepseek 必然存在"由类型系统背书。 */
+export const VENDORS: Record<VendorId, VendorInfo> = {
   deepseek: { label: 'DeepSeek', pricingUrl: 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/', tiered: false },
   zhipu: {
     label: '智谱 GLM',
@@ -154,6 +160,15 @@ export function vendorOf(model: string): string | undefined {
     }
   }
   return best
+}
+
+/**
+ * 按任意字符串安全查找厂商元信息（未知 id 返回 undefined）。
+ * hasOwn 收窄后断言到 VendorId 是合法的类型收窄（非危险断言）：
+ * 调用方拿到的 undefined 即"未知厂商"信号，无需非空断言。
+ */
+export function vendorInfoOf(vendorId: string): VendorInfo | undefined {
+  return Object.hasOwn(VENDORS, vendorId) ? VENDORS[vendorId as VendorId] : undefined
 }
 
 /** 某厂商的全部模型 id 前缀（用于在定价页表格中识别模型单元格）。 */

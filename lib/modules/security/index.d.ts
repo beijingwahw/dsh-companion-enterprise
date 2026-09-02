@@ -12,14 +12,15 @@
  * J2：GET /security/audit（筛选）、GET /security/audit/export（CSV/JSON）；
  * J3：GET /security/dlp/state、POST /security/dlp/settings、
  *     GET/POST/DELETE /security/dlp/rules、POST /security/dlp/scan（发送前预检）；
- * J4：GET /security/report（合规报表）、GET /security/report/export（HTML）。
+ * J4：GET /security/report（合规报表）、GET /security/report/export（HTML）；
+ * J8：POST /security/kanonymize（k-匿名泛化引擎，批量发布前再识别风险评估）。
  *
  * 安全红线：任何响应不回传 Key 明文（只回掩码尾 4 位）。
  */
 import type { Context } from '@deepseek-ai/cordis';
 /** 插件名。 */
 export declare const name = "companion-security";
-/** 依赖服务：companion 根服务。 */
+/** 依赖服务：companion 根服务 + 会话查询（污点追踪读会话日志）。 */
 export declare const inject: string[];
 /** 插件入口。 */
 export declare function apply(ctx: Context): void;

@@ -10,7 +10,7 @@
  * 解析优先级：用户覆盖 > DeepSeek 实时表 > 厂商实时表 > 内置目录精确 >
  * 最长前缀匹配。
  */
-import { CATALOG_TABLE, VENDORS, vendorOf } from './catalog.js'
+import { CATALOG_TABLE, VENDORS, vendorInfoOf, vendorOf } from './catalog.js'
 import {
   BROWSER_UA,
   parseDoubaoSheet,
@@ -510,8 +510,8 @@ export class PriceService {
     }
     result.push({
       id: 'deepseek',
-      label: VENDORS.deepseek!.label,
-      pricingUrl: this.sheet.sourceUrl ?? VENDORS.deepseek!.pricingUrl,
+      label: VENDORS.deepseek.label,
+      pricingUrl: this.sheet.sourceUrl ?? VENDORS.deepseek.pricingUrl,
       tiered: false,
       source: this.sheet.source === 'live' ? 'live' : 'builtin',
       fetchedAt: this.sheet.fetchedAt,
@@ -595,7 +595,7 @@ export class PriceService {
    *  - html（缺省）: 定价页 HTML 的通用表格解析。
    */
   async refreshVendor(vendorId: string): Promise<void> {
-    const info = VENDORS[vendorId]
+    const info = vendorInfoOf(vendorId)
     if (info === undefined) return
     try {
       const table = await this.fetchVendorTable(vendorId)
@@ -617,7 +617,9 @@ export class PriceService {
 
   /** 按 fetchKind 抓取解析某厂商的定价数据。 */
   private async fetchVendorTable(vendorId: string): Promise<PriceTable> {
-    const info = VENDORS[vendorId]!
+    const info = vendorInfoOf(vendorId)
+    // 唯一调用方 refreshVendor 已验证厂商存在；违背即不变量破坏，快速失败。
+    if (info === undefined) throw new Error(`companion-pricing: unknown vendor ${vendorId}`)
     const kind = info.fetchKind ?? 'html'
     if (kind === 'ernie-cdn') {
       const json = JSON.parse(await fetchText(info.dataSource ?? info.pricingUrl, this.timeoutMs, { 'user-agent': BROWSER_UA })) as {

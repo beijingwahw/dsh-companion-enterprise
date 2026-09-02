@@ -167,3 +167,56 @@
   flex: 1;
   min-width: 240px;
 }
+
+/* 金丝雀漂移监控（DriftPanel）。 */
+
+.driftRow {
+  cursor: pointer;
+}
+
+.driftRow:hover {
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+}
+
+.driftDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--dsw-alias-border-primary, #d0d7de);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.driftDetailHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.driftMeta {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.driftSummary {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.driftPillStable {
+  background: var(--dsw-alias-bg-success-subtle, #dafbe1);
+  color: var(--dsw-alias-fg-success, #1a7f37);
+}
+
+.driftPillWarning {
+  background: var(--dsw-alias-bg-warning-subtle, #fff8c5);
+  color: var(--dsw-alias-fg-warning, #9a6700);
+}
+
+.driftPillDrifted {
+  background: var(--dsw-alias-bg-danger-subtle, #ffebe9);
+  color: var(--dsw-alias-fg-danger, #cf222e);
+}

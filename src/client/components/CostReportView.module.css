@@ -280,3 +280,59 @@
   font-size: 12px;
   color: var(--dsw-alias-text-secondary, #646a73);
 }
+
+/* 自适应路由学习状态（模块 C 创新扩展） */
+
+.armHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.armTableWrap {
+  overflow-x: auto;
+}
+
+.armTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.armHead {
+  padding: 6px 10px;
+  text-align: right;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--dsw-alias-text-secondary, #646a73);
+  border-bottom: 1px solid var(--dsw-alias-border-default, #dee0e3);
+}
+
+.armHead:first-child {
+  text-align: left;
+}
+
+.armRow td {
+  padding: 6px 10px;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--dsw-alias-border-default, #dee0e3);
+}
+
+.armRow td:first-child {
+  text-align: left;
+}
+
+/* 当前最优行：品牌色浅底高亮（无对应语义令牌，使用品牌色回退值的 8% 透明度） */
+.armHighlight td {
+  background: rgba(77, 107, 254, 0.08);
+  font-weight: 600;
+}
+
+.bestBadge {
+  margin-left: 6px;
+  color: var(--dsw-alias-success-default, #00a870);
+  font-weight: 600;
+}

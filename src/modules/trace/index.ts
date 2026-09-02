@@ -9,12 +9,13 @@
  * - GET    /trace/get             读取单条轨迹（含异常与指标）；
  * - DELETE /trace                 删除已保存轨迹；
  * - POST   /trace/diff            两条轨迹对比（E3），可返回 HTML 对比报告；
- * - GET    /trace/stats           日聚合趋势 + 历史基准线（E4）。
+ * - GET    /trace/stats           日聚合趋势 + 历史基准线（E4）；
+ * - GET    /trace/spc             SPC 统计过程控制（EWMA 控制图 + 漂移检测）。
  *
  * 命令 `trace`：分析指定会话（或最近会话）并输出文本报告。
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { HttpError, sendJson } from '../../core/http.js'
+import { HttpError, clampNumberParam, sendJson } from '../../core/http.js'
 import { SessionId } from '../../core/ids.js'
 import type { CommandInvocation, CommandResult } from '../../types/harness.js'
 import {
@@ -28,6 +29,11 @@ import {
   slowestNodes,
 } from './analyzer.js'
 import { TraceStatsStore, TraceStore } from './store.js'
+import { analyzeSpc, DEFAULT_LAMBDA, DEFAULT_LIMIT_WIDTH, SPC_METRICS } from './spc.js'
+import type { SpcMetric } from './spc.js'
+import { checkPrecursors, minePrecursors } from './precursors.js'
+import { detectTraceAnomalies } from './anomaly.js'
+import { localizeFaults } from './localize.js'
 import type { Trace } from './types.js'
 
 /** 插件名。 */
@@ -46,6 +52,25 @@ export function apply(ctx: Context): void {
     if (!store) return
     const traceStore = new TraceStore(store.domain)
     const statsStore = new TraceStatsStore(store.domain)
+
+    /** 前兆挖掘数据源：已保存轨迹 + 全部会话派生轨迹（派生失败静默跳过）。 */
+    async function collectAllTraces(): Promise<Trace[]> {
+      const traces: Trace[] = [...traceStore.list()]
+      try {
+        const sessions = await ctx.sessionQuery.listSessions()
+        for (const session of sessions) {
+          try {
+            const snapshot = await ctx.sessionQuery.readSession(SessionId(session.id))
+            traces.push(deriveTraceFromLog(snapshot))
+          } catch {
+            // 单会话派生失败不影响其余语料。
+          }
+        }
+      } catch {
+        // 会话列表不可用：仅用已保存轨迹。
+      }
+      return traces
+    }
 
     try {
       ctx.effect(() => {
@@ -159,6 +184,90 @@ export function apply(ctx: Context): void {
             }
             if (from > to) throw new HttpError('from 不能晚于 to', 400)
             sendJson(res, 200, { days: statsStore.range(from, to), baseline: statsStore.baseline() })
+          }),
+
+          // SPC 统计过程控制：EWMA 控制图 + 漂移检测（创新扩展）。
+          // 用法：GET /trace/spc?from=...&to=...&metric=duration-per-trace&lambda=0.3&limitWidth=3
+          ctx.companion.http.add('GET', '/trace/spc', (_req, res, hctx) => {
+            const from = hctx.query.get('from') ?? ''
+            const to = hctx.query.get('to') ?? ''
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+              throw new HttpError('from/to 必须是 YYYY-MM-DD', 400)
+            }
+            if (from > to) throw new HttpError('from 不能晚于 to', 400)
+            const metricParam = hctx.query.get('metric') ?? 'duration-per-trace'
+            if (!SPC_METRICS.includes(metricParam as SpcMetric)) {
+              throw new HttpError(`metric 必须是 ${SPC_METRICS.join(' / ')} 之一`, 400)
+            }
+            const metric = metricParam as SpcMetric
+            const lambda = clampNumberParam(hctx.query.get('lambda'), DEFAULT_LAMBDA, 0.05, 0.95, 'lambda')
+            const limitWidth = clampNumberParam(hctx.query.get('limitWidth'), DEFAULT_LIMIT_WIDTH, 1, 5, 'limitWidth')
+            // Phase I 参数估计用全量历史（更稳健），图表只展示查询区间。
+            const rows = statsStore.range('0000-00-00', '9999-99-99')
+            const result = analyzeSpc(rows, metric, lambda, limitWidth)
+            sendJson(res, 200, {
+              ...result,
+              points: result.points.filter((p) => p.day >= from && p.day <= to),
+            })
+          }),
+
+          // 失败前兆挖掘：n-gram 序列模式 + 提升度筛选（创新扩展）。
+          // 数据源：已保存轨迹（摄入）+ 全部会话派生轨迹（实时派生不落盘）。
+          ctx.companion.http.add('GET', '/trace/precursors', async (_req, res) => {
+            const traces = await collectAllTraces()
+            sendJson(res, 200, minePrecursors(traces))
+          }),
+
+          // 孤立森林轨迹异常检测（创新扩展）：7 维特征 + iForest 全局评分。
+          // 用法：GET /trace/anomalies?limit=20&seed=123
+          ctx.companion.http.add('GET', '/trace/anomalies', async (_req, res, hctx) => {
+            const limitParam = Number(hctx.query.get('limit'))
+            const limit =
+              Number.isFinite(limitParam) && limitParam > 0 ? Math.min(Math.floor(limitParam), 100) : undefined
+            const seedParam = Number(hctx.query.get('seed'))
+            const seed = Number.isFinite(seedParam) && seedParam >= 0 ? Math.floor(seedParam) : undefined
+            const traces = await collectAllTraces()
+            sendJson(res, 200, detectTraceAnomalies(traces, limit, seed))
+          }),
+
+          // 实时预警：检查指定轨迹（或派生自会话）是否正走在已知失败之路上。
+          // 用法：POST /trace/precursors/check {traceId | sessionId}
+          ctx.companion.http.add('POST', '/trace/precursors/check', async (_req, res, hctx) => {
+            const body =
+              typeof hctx.body === 'object' && hctx.body !== null && !Array.isArray(hctx.body)
+                ? (hctx.body as Record<string, unknown>)
+                : {}
+            const traceId = typeof body.traceId === 'string' ? body.traceId : undefined
+            const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
+            if (!traceId && !sessionId) {
+              throw new HttpError('traceId 或 sessionId 必须提供一个', 400)
+            }
+            let trace: Trace
+            if (traceId) {
+              const saved = traceStore.get(traceId)
+              if (!saved) throw new HttpError('轨迹不存在', 404)
+              trace = saved
+            } else {
+              try {
+                const snapshot = await ctx.sessionQuery.readSession(SessionId(sessionId as string))
+                trace = deriveTraceFromLog(snapshot)
+              } catch {
+                throw new HttpError('会话不存在或无法派生轨迹', 404)
+              }
+            }
+            const library = minePrecursors(await collectAllTraces())
+            sendJson(res, 200, {
+              traceId: trace.id,
+              sessionId: trace.sessionId ?? null,
+              ...checkPrecursors(library.patterns, trace.nodes),
+            })
+          }),
+
+          // 频谱根因定位：SBFL Ochiai 可疑度 + 失败/成功差分画像（创新扩展）。
+          // 数据源与前兆挖掘一致：已保存轨迹 + 全部会话派生轨迹。
+          ctx.companion.http.add('GET', '/trace/localize', async (_req, res) => {
+            const traces = await collectAllTraces()
+            sendJson(res, 200, localizeFaults(traces))
           }),
 
           ctx.commands.register({
@@ -336,6 +445,8 @@ function requireQuery(query: URLSearchParams, key: string): string {
   if (!value || !value.trim()) throw new HttpError(`${key} 必填`, 400)
   return value.trim()
 }
+
+// clampNumber 已上移 core/http.ts（clampNumberParam，全插件唯一权威实现）。
 
 /** 将请求体收窄为 JSON 对象。 */
 function readObject(body: unknown): Record<string, unknown> {

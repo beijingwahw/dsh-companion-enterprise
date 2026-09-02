@@ -12,16 +12,22 @@
  * J2：GET /security/audit（筛选）、GET /security/audit/export（CSV/JSON）；
  * J3：GET /security/dlp/state、POST /security/dlp/settings、
  *     GET/POST/DELETE /security/dlp/rules、POST /security/dlp/scan（发送前预检）；
- * J4：GET /security/report（合规报表）、GET /security/report/export（HTML）。
+ * J4：GET /security/report（合规报表）、GET /security/report/export（HTML）；
+ * J8：POST /security/kanonymize（k-匿名泛化引擎，批量发布前再识别风险评估）。
  *
  * 安全红线：任何响应不回传 Key 明文（只回掩码尾 4 位）。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { HttpError, sendJson } from '../../core/http.js'
+import { SessionId } from '../../core/ids.js'
 import type { CallParams } from '../../core/service.js'
 import { beijingDayKey } from '../../core/time.js'
 import type { AuditEntry, NamedKeyMeta } from './types.js'
 import { redactText, scanText, validatePattern } from './dlp.js'
+import { kanonymize } from './kanon.js'
+import { InjectionSettingsStore, scanInjection } from './injection.js'
+import { SentinelStore, sentinelShouldBlock } from './sentinel.js'
+import { trackTaint } from './taint.js'
 import {
   AUDIT_LOG_LIMIT,
   AuditAlertStore,
@@ -36,8 +42,8 @@ import {
 /** 插件名。 */
 export const name = 'companion-security'
 
-/** 依赖服务：companion 根服务。 */
-export const inject = ['companion']
+/** 依赖服务：companion 根服务 + 会话查询（污点追踪读会话日志）。 */
+export const inject = ['companion', 'sessionQuery']
 
 /** 命名 Key 在保险库中的秘密名前缀。 */
 const NAMED_KEY_SECRET_PREFIX = 'named-key:'
@@ -64,6 +70,8 @@ export function apply(ctx: Context): void {
     const auditLog = new AuditLogStore(domain)
     const dlpRules = new DlpRuleStore(domain)
     const dlpSettings = new DlpSettingsStore(domain)
+    const injectionSettings = new InjectionSettingsStore(domain)
+    const sentinel = new SentinelStore(domain)
     const dlpBlocks = new DlpBlockStore(domain)
     const alerts = new AuditAlertStore(domain)
 
@@ -78,17 +86,57 @@ export function apply(ctx: Context): void {
         // ----------------------------------------------------------------
         const disposeHook = ctx.companion.addCallHook({
           beforeCall(params: CallParams): void {
-            const settings = dlpSettings.get()
-            if (!settings.enabled) return
             const text = params.messages.map((m) => m.content).join('\n')
-            const findings = scanText(text, dlpRules.list())
-            if (findings.length === 0) return
-            const names = findings.map((f) => `${f.ruleName}×${f.count}`).join('、')
-            void dlpBlocks.recordBlock(Date.now(), findings.map((f) => f.ruleName)).catch(() => undefined)
-            if (settings.strict) {
-              throw new HttpError(`【DLP 拦截】检测到敏感内容：${names}（严格模式，已阻止发送）`, 403)
+            // DLP：敏感内容外泄拦截。
+            const settings = dlpSettings.get()
+            if (settings.enabled) {
+              const findings = scanText(text, dlpRules.list())
+              if (findings.length > 0) {
+                const names = findings.map((f) => `${f.ruleName}×${f.count}`).join('、')
+                void dlpBlocks.recordBlock(Date.now(), findings.map((f) => f.ruleName)).catch(() => undefined)
+                if (settings.strict) {
+                  throw new HttpError(`【DLP 拦截】检测到敏感内容：${names}（严格模式，已阻止发送）`, 403)
+                }
+                ctx.companion.notice('warning', `【DLP 警告】Prompt 中检测到敏感内容：${names}`)
+              }
             }
-            ctx.companion.notice('warning', `【DLP 警告】Prompt 中检测到敏感内容：${names}`)
+            // 提示注入：恶意指令混入拦截（严格模式 + malicious 判定 → 403）。
+            // 哨兵联动：按调用源画像升级防御等级（watch 拦 suspicious、
+            // quarantined 一票否决），慢攻/试探性攻击无法绕过。
+            const injection = injectionSettings.get()
+            if (injection.enabled) {
+              const result = scanInjection(text)
+              const level = sentinel.get(params.source)?.level ?? 'normal'
+              if (result.verdict !== 'clean') {
+                const names = result.findings.map((f) => `${f.category}×${f.count}`).join('、')
+                void dlpBlocks
+                  .recordBlock(Date.now(), result.findings.map((f) => `提示注入:${f.category}`))
+                  .catch(() => undefined)
+                void sentinel
+                  .record(params.source, {
+                    ts: Date.now(),
+                    risk: result.risk,
+                    verdict: result.verdict,
+                    categories: names,
+                  })
+                  .catch(() => undefined)
+                if (
+                  sentinelShouldBlock(level, result.verdict) ||
+                  (injection.strict && result.verdict === 'malicious')
+                ) {
+                  throw new HttpError(
+                    `【注入拦截】检测到提示注入攻击（风险 ${result.risk}/100）：${names}` +
+                      (level !== 'normal' ? `（攻击源已升级为 ${level} 级防御）` : '（严格模式，已阻止发送）'),
+                    403,
+                  )
+                }
+                ctx.companion.notice(
+                  'warning',
+                  `【注入警告】检测到疑似提示注入（风险 ${result.risk}/100，${result.verdict}）：${names}` +
+                    (level !== 'normal' ? `；攻击源风险等级 ${level}` : ''),
+                )
+              }
+            }
           },
           afterCall(params, result, error, costCny): void {
             const ts = Date.now()
@@ -316,6 +364,85 @@ export function apply(ctx: Context): void {
             const text = requireString(body.text, 'text')
             const findings = scanText(text, dlpRules.list())
             sendJson(res, 200, { findings, clean: findings.length === 0, settings: dlpSettings.get() })
+          }),
+
+          // --------------------------------------------------------------
+          // J5 提示注入检测
+          // --------------------------------------------------------------
+          ctx.companion.http.add('GET', '/security/injection/state', (_req, res) => {
+            sendJson(res, 200, {
+              settings: injectionSettings.get(),
+              detectors: ['instruction-override', 'role-jailbreak', 'system-exfil', 'tool-hijack', 'delimiter-confusion', 'encoding-evasion'],
+            })
+          }),
+
+          ctx.companion.http.add('POST', '/security/injection/settings', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const patch: { enabled?: boolean; strict?: boolean } = {}
+            if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
+            if (typeof body.strict === 'boolean') patch.strict = body.strict
+            sendJson(res, 200, { settings: await injectionSettings.update(patch) })
+          }),
+
+          ctx.companion.http.add('POST', '/security/injection/scan', (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const text = requireString(body.text, 'text')
+            sendJson(res, 200, { ...scanInjection(text), settings: injectionSettings.get() })
+          }),
+
+          // J6 攻击者画像：全部攻击源画像（风险分/等级/最近事件）。
+          ctx.companion.http.add('GET', '/security/sentinel', (_req, res) => {
+            sendJson(res, 200, { profiles: sentinel.list() })
+          }),
+
+          // 画像平反：source 缺省清空全部画像。
+          ctx.companion.http.add('POST', '/security/sentinel/reset', async (_req, res, hctx) => {
+            const source = hctx.query.get('source')
+            await sentinel.reset(source ?? undefined)
+            sendJson(res, 200, { ok: true })
+          }),
+
+          // J7 敏感数据污点追踪：source → 传播链 → sink 的完整泄露路径。
+          // 报告全程只含掩码值（安全红线：原始敏感值不外发）。
+          ctx.companion.http.add('POST', '/security/taint/scan', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const sessionId = requireString(body.sessionId, 'sessionId')
+            let snapshot
+            try {
+              snapshot = await ctx.sessionQuery.readSession(SessionId(sessionId))
+            } catch (error) {
+              throw new HttpError(
+                `读取会话失败：${error instanceof Error ? error.message : String(error)}`,
+                404,
+              )
+            }
+            sendJson(res, 200, trackTaint(snapshot, dlpRules.list()))
+          }),
+
+          // J8 k-匿名泛化引擎（创新扩展）：批量数据发布前的再识别风险评估。
+          // 用法：POST /security/kanonymize {records: [{age,zip,birth,city,gender,...}], k}
+          ctx.companion.http.add('POST', '/security/kanonymize', (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const rawRecords = body.records
+            if (!Array.isArray(rawRecords) || rawRecords.length === 0) {
+              throw new HttpError('records 必须是非空数组', 400)
+            }
+            if (rawRecords.length > 5000) throw new HttpError('records 不能超过 5000 条', 400)
+            const k = body.k
+            if (typeof k !== 'number' || !Number.isInteger(k) || k < 2) {
+              throw new HttpError('k 必须是 ≥2 的整数', 400)
+            }
+            const records = rawRecords.map((raw, index) => {
+              if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+                throw new HttpError(`records[${index}] 必须是对象`, 400)
+              }
+              return raw as Record<string, unknown>
+            })
+            try {
+              sendJson(res, 200, kanonymize(records, k))
+            } catch (error) {
+              throw new HttpError(error instanceof Error ? error.message : '匿名化失败', 400)
+            }
           }),
 
           // --------------------------------------------------------------

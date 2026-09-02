@@ -115,3 +115,255 @@
   display: flex;
   justify-content: flex-end;
 }
+
+/* ---------- 结构化分级交接面板 ---------- */
+
+.modeSwitch {
+  display: flex;
+  gap: 8px;
+}
+
+.warnBanner {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--dsw-alias-warning-default, #d48806);
+  background: var(--dsw-alias-warning-bg, rgba(250, 173, 20, 0.12));
+}
+
+.gateBanner {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--dsw-alias-success-default, #34c724);
+  background: var(--dsw-alias-success-bg, rgba(52, 199, 36, 0.1));
+}
+
+.tier {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tierTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.tierHint {
+  font-size: 12px;
+  color: var(--dsw-alias-text-tertiary, #8f959e);
+}
+
+.tierItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-container, #ffffff);
+}
+
+.tierItemRestored {
+  border-color: var(--dsw-alias-warning-default, #d48806);
+  background: var(--dsw-alias-warning-bg, rgba(250, 173, 20, 0.08));
+}
+
+.tierText {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-text-primary, #1f2329);
+  word-break: break-word;
+}
+
+.tierMono {
+  flex: 1;
+  min-width: 0;
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-text-primary, #1f2329);
+  word-break: break-all;
+}
+
+.tierArchived {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-text-tertiary, #8f959e);
+  border-left: 2px solid var(--dsw-alias-border-default, #dee0e3);
+}
+
+.tierBadges {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.badgeRestored,
+.badgeOrigin,
+.badgeNew,
+.badgeKind,
+.badgeDisposition {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.badgeRestored {
+  background: var(--dsw-alias-warning-bg, rgba(250, 173, 20, 0.12));
+  color: var(--dsw-alias-warning-default, #d48806);
+}
+
+.badgeOrigin {
+  background: var(--dsw-alias-info-bg, rgba(52, 112, 255, 0.1));
+  color: var(--dsw-alias-info-default, #3470ff);
+}
+
+.badgeNew {
+  background: var(--dsw-alias-bg-secondary, #f5f6f7);
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.badgeKind {
+  flex-shrink: 0;
+  background: var(--dsw-alias-bg-secondary, #f5f6f7);
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.badgeDisposition {
+  flex-shrink: 0;
+}
+
+.badgeInherited {
+  background: var(--dsw-alias-success-bg, rgba(52, 199, 36, 0.1));
+  color: var(--dsw-alias-success-default, #34c724);
+}
+
+.badgeEvolved {
+  background: var(--dsw-alias-info-bg, rgba(52, 112, 255, 0.1));
+  color: var(--dsw-alias-info-default, #3470ff);
+}
+
+.badgeDropped {
+  background: var(--dsw-alias-danger-bg, rgba(245, 74, 69, 0.08));
+  color: var(--dsw-alias-danger-default, #f54a45);
+}
+
+.dispositionItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 6px;
+}
+
+.dispositionReason {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-text-tertiary, #8f959e);
+}
+
+/* ---------- 世系链 ---------- */
+
+.lineageToggle {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-info-default, #3470ff);
+  cursor: pointer;
+}
+
+.lineageToggle:hover {
+  text-decoration: underline;
+}
+
+.lineageList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.lineageRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-container, #ffffff);
+  cursor: pointer;
+  text-align: left;
+}
+
+.lineageRow:hover {
+  border-color: var(--dsw-alias-info-default, #3470ff);
+}
+
+.lineageDepth {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.lineageTitle {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--dsw-alias-text-primary, #1f2329);
+}
+
+.lineageCounts {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-text-tertiary, #8f959e);
+}
+
+.traceChain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f5f6f7);
+}
+
+.traceEntry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-container, #ffffff);
+}
+
+.traceMeta {
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.traceAnchor {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-text-primary, #1f2329);
+  word-break: break-word;
+}
+
+.traceDropped {
+  font-size: 12px;
+  color: var(--dsw-alias-danger-default, #f54a45);
+  word-break: break-word;
+}

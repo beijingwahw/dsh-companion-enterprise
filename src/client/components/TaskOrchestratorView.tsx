@@ -4,7 +4,8 @@
  *   自动生成 YAML 配置；
  * - H2 断点续跑：启动/暂停/取消/恢复执行，进度条 + 每步中间结果展示；
  * - H3 批量任务队列：优先级/截止时间/失败策略，批量暂停/恢复/取消；
- * - H4 定时调度：Cron 与自然语言双输入，峰谷空闲时段选项，历史执行归档。
+ * - H4 定时调度：Cron 与自然语言双输入，峰谷空闲时段选项，历史执行归档；
+ * - H 创新扩展：模型断路器（失败累积自动熔断，open 期间避让 / half-open 探针验证恢复）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
@@ -17,6 +18,7 @@ import {
   deletePipeline,
   deletePipelineRun,
   deleteQueueTask,
+  fetchCircuits,
   fetchJobRuns,
   fetchJobs,
   fetchPipelineRun,
@@ -36,6 +38,7 @@ import {
   toggleJob,
 } from '../api.js'
 import type {
+  CircuitSnapshotRow,
   OrchestratorJob,
   OrchestratorJobRun,
   OrchestratorPipeline,
@@ -53,7 +56,7 @@ export interface TaskOrchestratorViewProps {
 }
 
 /** 子面板页签。 */
-type Tab = 'pipelines' | 'queue' | 'jobs'
+type Tab = 'pipelines' | 'queue' | 'jobs' | 'circuits'
 
 /** 任务编排视图页。 */
 export function TaskOrchestratorView(_props: TaskOrchestratorViewProps): ReactElement {
@@ -71,10 +74,14 @@ export function TaskOrchestratorView(_props: TaskOrchestratorViewProps): ReactEl
         <Button size="sm" variant={tab === 'jobs' ? 'primary' : 'secondary'} onClick={() => setTab('jobs')}>
           定时调度
         </Button>
+        <Button size="sm" variant={tab === 'circuits' ? 'primary' : 'secondary'} onClick={() => setTab('circuits')}>
+          模型断路器
+        </Button>
       </div>
       {tab === 'pipelines' && <PipelinePanel />}
       {tab === 'queue' && <QueuePanel />}
       {tab === 'jobs' && <JobPanel />}
+      {tab === 'circuits' && <CircuitPanel />}
     </div>
   )
 }
@@ -1104,5 +1111,107 @@ function JobPanel(): ReactElement {
         )}
       </section>
     </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// H 创新扩展：模型断路器（/orchestrator/circuits）
+// ---------------------------------------------------------------------------
+
+/** 断路器状态 → 中文展示名。 */
+const CIRCUIT_STATE_LABELS: Readonly<Record<string, string>> = {
+  closed: '正常放行',
+  open: '熔断中',
+  'half-open': '验证恢复',
+}
+
+/** 断路器状态徽标（closed 绿 / open 红 / half-open 黄）。 */
+function CircuitStatePill(props: { state: CircuitSnapshotRow['state'] }): ReactElement {
+  const cls =
+    props.state === 'open'
+      ? `${styles.circuitState} ${styles.circuitStateOpen}`
+      : props.state === 'half-open'
+        ? `${styles.circuitState} ${styles.circuitStateHalfOpen}`
+        : `${styles.circuitState} ${styles.circuitStateClosed}`
+  return <span className={cls}>{CIRCUIT_STATE_LABELS[props.state] ?? props.state}</span>
+}
+
+/** 模型断路器面板：全景快照 + 30s 轮询 + 状态图例。 */
+function CircuitPanel(): ReactElement {
+  const [circuits, setCircuits] = useState<readonly CircuitSnapshotRow[] | null>(null)
+  const [legend, setLegend] = useState<Readonly<Record<string, string>>>({})
+
+  /** 拉取断路器全景；silent 为 true 时失败不弹 Toast（供轮询静默重试）。 */
+  const load = useCallback((silent: boolean): Promise<void> => {
+    return fetchCircuits()
+      .then((response) => {
+        setCircuits(response.circuits)
+        setLegend(response.legend)
+      })
+      .catch((error) => {
+        if (!silent) reportError(error, '加载断路器状态失败')
+      })
+  }, [])
+
+  useEffect(() => {
+    load(false)
+  }, [load])
+
+  // 30s 链式轮询（同队列面板风格：上次响应落定后再排下一次，失败静默重试）。
+  useEffect(() => {
+    let cancelled = false
+    let timer: number | null = null
+    const tick = (): void => {
+      load(true).finally(() => {
+        if (!cancelled) timer = window.setTimeout(tick, 30_000)
+      })
+    }
+    timer = window.setTimeout(tick, 30_000)
+    return () => {
+      cancelled = true
+      if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [load])
+
+  return (
+    <section className={styles.section}>
+      <div className={styles.sectionHeader}>
+        <h3>模型断路器</h3>
+        <Button size="sm" variant="secondary" onClick={() => load(false)}>
+          刷新
+        </Button>
+      </div>
+      {circuits === null ? (
+        <Spinner label="加载断路器状态…" />
+      ) : circuits.length === 0 ? (
+        <p className={styles.empty}>暂无断路器记录：模型调用失败累积后自动出现。</p>
+      ) : (
+        <div className={styles.circuitList}>
+          {circuits.map((row) => (
+            <div key={row.model} className={styles.circuitCard}>
+              <div className={styles.circuitHead}>
+                <span className={styles.circuitModel}>{row.model}</span>
+                <CircuitStatePill state={row.state} />
+              </div>
+              <div className={styles.circuitMeta}>
+                连续失败 {row.failures} 次 · 熔断时间 {row.state === 'closed' ? '-' : formatTime(row.openedAt)} · 探针时间{' '}
+                {formatTime(row.probeAt)}
+              </div>
+              {legend[row.state] ? <p className={styles.circuitDesc}>{legend[row.state]}</p> : null}
+            </div>
+          ))}
+        </div>
+      )}
+      {Object.keys(legend).length > 0 && (
+        <div className={styles.circuitLegendBar}>
+          {Object.entries(legend).map(([state, text]) => (
+            <span key={state} className={styles.circuitLegendItem}>
+              {CIRCUIT_STATE_LABELS[state] ?? state}：{text}
+            </span>
+          ))}
+        </div>
+      )}
+      <p className={styles.hint}>流水线/队列/定时任务在 open 期间自动避让该模型；half-open 放行单个探针调用验证恢复。</p>
+    </section>
   )
 }

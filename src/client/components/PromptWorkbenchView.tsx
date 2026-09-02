@@ -3,15 +3,17 @@
  * - F1 版本管理：保存/回滚/打标签，历史列表；
  * - F2 A/B 测试：左右分栏对比两版本输出，批量测试集，自动指标对比，人工评分；
  * - F3 模板库：内置 + 自定义模板，变量插值表单，一键生成 API 调用代码；
- * - F4 结构化校验：定义 JSON Schema，批量校验合规率，高亮违规字段。
+ * - F4 结构化校验：定义 JSON Schema，批量校验合规率，高亮违规字段；
+ * - 自动优化：元提示生成候选变体 → 用例配对评测 → 显著性检验，显著胜者晋升版本。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
-import { Button, Input, Select, Spinner, Textarea, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, Input, Pill, Select, Spinner, Textarea, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   fetchPromptTemplates,
   fetchPromptVersions,
   generateApiCode,
+  optimizePrompt,
   rateAbTest,
   renderPromptTemplate,
   rollbackPromptVersion,
@@ -23,6 +25,8 @@ import {
 } from '../api.js'
 import type {
   AbTestResponse,
+  OptimizeCase,
+  PromptOptimizeResponse,
   PromptRatings,
   PromptTemplate,
   PromptVersion,
@@ -36,7 +40,7 @@ export interface PromptWorkbenchViewProps {
 }
 
 /** 子面板页签。 */
-type Tab = 'versions' | 'ab' | 'templates' | 'validate'
+type Tab = 'versions' | 'ab' | 'templates' | 'validate' | 'optimize'
 
 /** Prompt 工程工作台视图页。 */
 export function PromptWorkbenchView(_props: PromptWorkbenchViewProps): ReactElement {
@@ -57,11 +61,15 @@ export function PromptWorkbenchView(_props: PromptWorkbenchViewProps): ReactElem
         <Button size="sm" variant={tab === 'validate' ? 'primary' : 'secondary'} onClick={() => setTab('validate')}>
           结构化校验
         </Button>
+        <Button size="sm" variant={tab === 'optimize' ? 'primary' : 'secondary'} onClick={() => setTab('optimize')}>
+          自动优化
+        </Button>
       </div>
       {tab === 'versions' && <VersionsPanel />}
       {tab === 'ab' && <AbTestPanel />}
       {tab === 'templates' && <TemplatesPanel />}
       {tab === 'validate' && <ValidatePanel />}
+      {tab === 'optimize' && <OptimizePanel />}
     </div>
   )
 }
@@ -508,5 +516,195 @@ function ValidatePanel(): ReactElement {
         </>
       )}
     </section>
+  )
+}
+
+/** 用例编辑草稿行（expected 留空表示走模型评审员裁决）。 */
+interface OptimizeCaseDraft {
+  readonly input: string
+  readonly expected: string
+}
+
+/** 用例数下限（配对符号检验需要不一致对）与上限（与服务端一致）。 */
+const MIN_OPTIMIZE_CASES = 2
+const MAX_OPTIMIZE_CASES = 10
+
+/** 新建空白用例草稿行。 */
+function emptyCaseDraft(): OptimizeCaseDraft {
+  return { input: '', expected: '' }
+}
+
+/** 自动优化面板：元提示生成候选 → 用例配对评测 → 显著性检验，显著胜者晋升版本。 */
+function OptimizePanel(): ReactElement {
+  const [prompt, setPrompt] = useState('')
+  const [cases, setCases] = useState<readonly OptimizeCaseDraft[]>([emptyCaseDraft(), emptyCaseDraft()])
+  const [candidateCount, setCandidateCount] = useState('2')
+  const [save, setSave] = useState(true)
+  const [result, setResult] = useState<PromptOptimizeResponse | undefined>()
+  const [busy, setBusy] = useState(false)
+
+  /** 更新第 index 行草稿字段。 */
+  const updateCase = useCallback((index: number, patch: Partial<OptimizeCaseDraft>): void => {
+    setCases((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }, [])
+
+  /** 添加用例行（上限 10 条）。 */
+  const addCase = useCallback((): void => {
+    setCases((prev) => {
+      if (prev.length >= MAX_OPTIMIZE_CASES) {
+        Toast.push(`用例最多 ${MAX_OPTIMIZE_CASES} 条`, 'warning')
+        return prev
+      }
+      return [...prev, emptyCaseDraft()]
+    })
+  }, [])
+
+  /** 删除第 index 行用例。 */
+  const removeCase = useCallback((index: number): void => {
+    setCases((prev) => prev.filter((_, i) => i !== index))
+  }, [])
+
+  /** 开始优化：跑多轮模型评测（基线 + 候选 × 用例），给长超时。 */
+  const run = useCallback(async () => {
+    if (!prompt.trim()) return
+    // 仅取 input 非空的行；expected 留空走模型评审员（不下发该字段）。
+    const validCases: readonly OptimizeCase[] = cases
+      .filter((row) => row.input.trim() !== '')
+      .map((row) => {
+        const expected = row.expected.trim()
+        return expected === '' ? { input: row.input.trim() } : { input: row.input.trim(), expected }
+      })
+    if (validCases.length < MIN_OPTIMIZE_CASES) {
+      Toast.push('配对检验至少需要 2 条用例', 'warning')
+      return
+    }
+    setBusy(true)
+    setResult(undefined)
+    try {
+      const response = await optimizePrompt(
+        { prompt, cases: validCases, candidates: Number(candidateCount), save },
+        { timeoutMs: 300_000 },
+      )
+      setResult(response)
+    } catch (err) {
+      Toast.push(err instanceof Error ? err.message : '优化失败', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }, [prompt, cases, candidateCount, save])
+
+  return (
+    <section className={styles.section}>
+      <p className={styles.optimizeHint}>
+        元提示生成候选变体 → 用例配对评测 → 符号显著性检验（McNemar
+        精确法）；仅统计显著且净胜的变体会晋升为新版本，避免小样本过拟合。
+      </p>
+      <h3>当前 Prompt</h3>
+      <Textarea
+        value={prompt}
+        rows={5}
+        placeholder="粘贴要优化的 Prompt（可从「版本管理」复制当前版本内容，或直接输入）…"
+        onChange={(event) => setPrompt(event.target.value)}
+      />
+      <h3>
+        用例（{cases.length}/{MAX_OPTIMIZE_CASES} 条，至少 2 条才能运行；参考答案可选）
+      </h3>
+      <div className={styles.optimizeCaseList}>
+        {cases.map((row, index) => (
+          <div key={index} className={styles.optimizeCaseRow}>
+            <span className={styles.optimizeCaseIndex}>用例 {index + 1}</span>
+            <Input
+              value={row.input}
+              placeholder={`用例 ${index + 1} 输入`}
+              onChange={(event) => updateCase(index, { input: event.target.value })}
+            />
+            <Input
+              value={row.expected}
+              placeholder="参考答案（可选，留空走模型评审员）"
+              onChange={(event) => updateCase(index, { expected: event.target.value })}
+            />
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => removeCase(index)}>
+              删除
+            </Button>
+          </div>
+        ))}
+      </div>
+      <div className={styles.row}>
+        <Button size="sm" variant="secondary" disabled={busy} onClick={addCase}>
+          添加用例
+        </Button>
+        <Select value={candidateCount} onChange={(event) => setCandidateCount(event.target.value)}>
+          <option value="1">候选变体数：1</option>
+          <option value="2">候选变体数：2</option>
+          <option value="3">候选变体数：3</option>
+        </Select>
+        <Checkbox checked={save} label="显著胜出时自动保存为新版本" onChange={(checked) => setSave(checked)} />
+        <Button variant="primary" size="sm" disabled={busy || !prompt.trim()} onClick={() => void run()}>
+          {busy ? '优化中…' : '开始优化'}
+        </Button>
+      </div>
+      {busy && <Spinner label="正在生成候选并逐用例评测（多轮模型调用，可能耗时数分钟）…" />}
+      {result && <OptimizeResultView result={result} />}
+    </section>
+  )
+}
+
+/** 优化结果视图：基线摘要、候选卡（胜者高亮）、显著性检验详情与晋升横幅。 */
+function OptimizeResultView(props: { result: PromptOptimizeResponse }): ReactElement {
+  const { result } = props
+  // 服务端对"净胜但不显著"的候选也会返回下标，仅统计显著时才算显著胜者。
+  const significantWin = result.winnerIndex !== undefined && result.significance?.significant === true
+  return (
+    <div className={styles.optimizeResult}>
+      {result.savedVersion !== undefined && (
+        <p className={styles.optimizeBanner}>
+          已晋升版本 v{result.savedVersion.version}（显著胜出的候选已保存为新版本，可在「版本管理」查看）。
+        </p>
+      )}
+      <p className={styles.optimizeBaseline}>
+        <strong>基线通过率 {(result.baseline.passRate * 100).toFixed(0)}%</strong>
+        {result.baseline.failures.length > 0 && (
+          <span className={styles.optimizeFailures}>
+            失败用例：{result.baseline.failures.map((index) => `#${index + 1}`).join('、')}
+          </span>
+        )}
+      </p>
+      {result.candidates.length === 0 ? (
+        <p className={styles.optimizeNotice}>基线用例全部通过，未生成候选变体（无改进空间）。</p>
+      ) : (
+        <div className={styles.optimizeCandidates}>
+          {result.candidates.map((candidate, index) => (
+            <div
+              key={index}
+              className={significantWin && index === result.winnerIndex ? styles.optimizeWinner : styles.optimizeCandidate}
+            >
+              <div className={styles.optimizeCandidateHeader}>
+                <strong>候选 {index + 1}</strong>
+                <span>通过率 {(candidate.passRate * 100).toFixed(0)}%</span>
+                <span>
+                  相对基线 胜 {candidate.wins} / 负 {candidate.losses}
+                </span>
+                {significantWin && index === result.winnerIndex && (
+                  <Pill className={styles.optimizePillWinner}>显著胜出</Pill>
+                )}
+              </div>
+              <pre className={styles.optimizeCandidateContent}>{candidate.content}</pre>
+            </div>
+          ))}
+        </div>
+      )}
+      {result.significance !== undefined && (
+        <p className={styles.optimizeSignificance}>
+          配对符号检验：基线败 &amp; 候选胜 {result.significance.b} 对 · 基线胜 &amp; 候选败 {result.significance.c} 对 ·
+          p={result.significance.pValue.toFixed(4)}
+          <Pill className={result.significance.significant ? styles.optimizePillWinner : styles.optimizePillMuted}>
+            {result.significance.significant ? '显著' : '不显著'}
+          </Pill>
+        </p>
+      )}
+      {!significantWin && (
+        <p className={styles.optimizeNotice}>未达统计显著性（p&gt;0.1）或无净胜，不晋升——避免小样本过拟合。</p>
+      )}
+    </div>
   )
 }

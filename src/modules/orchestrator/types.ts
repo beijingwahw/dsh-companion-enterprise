@@ -38,6 +38,11 @@ export interface PipelineStep {
   readonly retryIntervalMs: number
   /** 依赖的上游步骤 id（空数组=无依赖，可并行）。 */
   readonly dependsOn: readonly string[]
+  /**
+   * 自愈降级模型（空=不降级）：主模型耗尽重试或被断路器熔断后，
+   * 自动用该模型补跑一次（如 deepseek-reasoner → deepseek-chat）。
+   */
+  readonly fallbackModel: string
 }
 
 /** 流水线定义（H1）。 */
@@ -61,6 +66,8 @@ export interface StepRun {
   endedAt: number
   latencyMs: number
   tokens: number
+  /** 是否经降级模型完成（自愈执行痕迹）。 */
+  usedFallback: boolean
 }
 
 /** 一次流水线执行（H2：断点续跑单元）。 */

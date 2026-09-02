@@ -247,3 +247,146 @@
   border-radius: 8px;
   padding: 10px;
 }
+
+/* ---- 经验蒸馏面板（模块 I 创新扩展：信号挖矿 → 元提示蒸馏 → 去重合并 → 证据链回溯）---- */
+
+/* 品牌蓝 Pill：蒸馏结果 merged=合并 状态。 */
+.pillBrand {
+  background: var(--dsw-alias-brand-default, #4d6bfe);
+  color: var(--dsw-alias-fg-inverse, #ffffff);
+}
+
+.distillReport {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--dsw-alias-border-primary, #d0d7de);
+  padding-top: 8px;
+}
+
+.distillSummary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.distillCandidateList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.distillCandidate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-size: 13px;
+}
+
+.distillCandidateTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.distillResultList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.distillResultItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-size: 13px;
+}
+
+.distillResultLesson {
+  flex: 1;
+  min-width: 200px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.distillErrorList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.distillLesson {
+  margin: 0;
+  font-size: 13px;
+  color: var(--dsw-alias-fg-primary, #1f2328);
+}
+
+.distillTags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.distillPS {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-size: 13px;
+}
+
+.distillPSLabel {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.distillEvidence {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px dashed var(--dsw-alias-border-primary, #d0d7de);
+  padding-top: 8px;
+}
+
+.distillEvidenceItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.distillEvidenceHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.distillEvidenceSeq {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+/* 证据摘录：等宽字体原文回溯定位。 */
+.distillEvidenceExcerpt {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-secondary, #f6f8fa);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

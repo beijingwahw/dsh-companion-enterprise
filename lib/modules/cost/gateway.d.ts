@@ -21,6 +21,7 @@
  */
 import { Service, type Context } from '@deepseek-ai/cordis';
 import type { ChatMessage, ChatResult } from '../../core/deepseek.js';
+import { type ArmReport, type TaskClass } from './adaptive.js';
 import { type BudgetSnapshot } from './budget.js';
 import { type QueuedTaskInfo } from './scheduler.js';
 import type { CostSettings } from './settings.js';
@@ -48,6 +49,10 @@ export interface CostGateway {
     budgetState(): Promise<BudgetSnapshot>;
     /** 峰谷调度等待队列快照。 */
     queueSnapshot(): readonly QueuedTaskInfo[];
+    /** 自适应路由面板：两类任务各自的赌臂统计。 */
+    adaptiveReport(): Promise<Record<TaskClass, ArmReport[]>>;
+    /** 清空自适应路由学习状态（缺省全部类别）。 */
+    adaptiveReset(cls?: TaskClass): Promise<void>;
 }
 declare module '@deepseek-ai/cordis' {
     interface Context {
@@ -58,6 +63,7 @@ declare module '@deepseek-ai/cordis' {
 export declare class CostGatewayService extends Service implements CostGateway {
     readonly ctx: Context;
     private readonly router;
+    private readonly adaptive;
     private readonly scheduler;
     private readonly estimator;
     private readonly getSettings;
@@ -72,6 +78,19 @@ export declare class CostGatewayService extends Service implements CostGateway {
     call(params: CostCallParams): Promise<ChatResult>;
     budgetState(): Promise<BudgetSnapshot>;
     queueSnapshot(): readonly QueuedTaskInfo[];
+    /** 自适应路由面板：两类任务各自的赌臂统计（均值奖励/UCB/失败率等）。 */
+    adaptiveReport(): Promise<Record<TaskClass, ArmReport[]>>;
+    /** 清空自适应路由学习状态（缺省全部类别）。 */
+    adaptiveReset(cls?: TaskClass): Promise<void>;
+    /**
+     * 自适应路由观测（best-effort）：合成奖励并写入赌博机；
+     * 观测或持久化失败静默，绝不影响调用主流程。
+     */
+    private observeAdaptive;
+    /** 候选集最低代理单价（元/百万 tokens）：奖励合成的成本分母。 */
+    private cheapestProxyPrice;
+    /** 模型代理单价：(输入未命中价 + 输出价) / 2，元/百万 tokens；未知模型取 0（得分兜底 1）。 */
+    private proxyPrice;
     /**
      * 一次成功调用的实际费用（元）：经动态计价引擎按调用完成时刻解析
      * （峰谷分时感知），与核心服务记账、节省额结算同源同口径。

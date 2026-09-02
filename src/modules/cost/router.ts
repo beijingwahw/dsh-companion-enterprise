@@ -11,6 +11,7 @@
  * MAX_RULE_PATTERN_LENGTH；运行期正则经 ModelRouter 内部缓存预编译复用，
  * 不在热路径重复 new RegExp。
  */
+import type { TaskClass } from './adaptive.js'
 import type { CostCustomRule, CostSettings } from './settings.js'
 
 /** 自定义路由规则数量上限（保存入口校验）。 */
@@ -25,6 +26,8 @@ export interface RouteDecision {
   model: string
   /** 判定原因（供日志与诊断展示）。 */
   reason: string
+  /** 判定来源：custom-rule=用户显式规则（自适应路由不接管）；keyword/default=可学习。 */
+  source: 'custom-rule' | 'keyword' | 'default'
 }
 
 /** 携带预编译正则的路由规则对象。 */
@@ -92,29 +95,56 @@ export class ModelRouter {
   resolve(taskHint: string | undefined, settings: CostSettings): RouteDecision {
     const hint = (taskHint ?? '').trim()
     if (!hint) {
-      return { model: settings.simpleModel, reason: '无任务提示，缺省使用简单模型' }
+      return {
+        model: settings.simpleModel,
+        reason: '无任务提示，缺省使用简单模型',
+        source: 'default',
+      }
     }
     // 1. 自定义规则优先。
     for (const rule of settings.customRules) {
       const pattern = rule.pattern.trim()
       if (pattern && this.matchPattern(hint, pattern)) {
-        return { model: rule.model, reason: `自定义规则命中：${pattern}` }
+        return { model: rule.model, reason: `自定义规则命中：${pattern}`, source: 'custom-rule' }
       }
     }
     // 2. 关键词启发式（先简单类，后复杂类）。
     const lowered = hint.toLowerCase()
     for (const keyword of SIMPLE_KEYWORDS) {
       if (lowered.includes(keyword)) {
-        return { model: settings.simpleModel, reason: `简单任务关键词命中：${keyword}` }
+        return {
+          model: settings.simpleModel,
+          reason: `简单任务关键词命中：${keyword}`,
+          source: 'keyword',
+        }
       }
     }
     for (const keyword of COMPLEX_KEYWORDS) {
       if (lowered.includes(keyword)) {
-        return { model: settings.complexModel, reason: `复杂任务关键词命中：${keyword}` }
+        return {
+          model: settings.complexModel,
+          reason: `复杂任务关键词命中：${keyword}`,
+          source: 'keyword',
+        }
       }
     }
     // 3. 缺省简单模型。
-    return { model: settings.simpleModel, reason: '未命中关键词，缺省使用简单模型' }
+    return { model: settings.simpleModel, reason: '未命中关键词，缺省使用简单模型', source: 'default' }
+  }
+
+  /**
+   * 任务难度分类（自适应路由的学习维度）：复杂类关键词命中 → 'complex'，
+   * 否则 'simple'。与 resolve() 的关键词启发式同源，保证两套路由
+   * 对同一 taskHint 的难度判定一致。
+   */
+  classify(taskHint: string | undefined): TaskClass {
+    const hint = (taskHint ?? '').trim()
+    if (!hint) return 'simple'
+    const lowered = hint.toLowerCase()
+    for (const keyword of COMPLEX_KEYWORDS) {
+      if (lowered.includes(keyword)) return 'complex'
+    }
+    return 'simple'
   }
 
   /**

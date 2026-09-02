@@ -7,7 +7,15 @@
  *    POST /prompt/rate、GET /prompt/ratings；
  * F3 模板库：GET/POST/DELETE /prompt/templates、POST /prompt/render（变量插值）、
  *    POST /prompt/codegen（一键生成 Python/Node.js/curl 调用代码）；
- * F4 结构化校验：POST /prompt/validate（批量发送并按 JSON Schema 校验合规率）。
+ * F4 结构化校验：POST /prompt/validate（批量发送并按 JSON Schema 校验合规率）；
+ * F5 自动优化：POST /prompt/optimize（元提示变异 + 配对显著性检验，
+ *    统计显著更优时自动晋升为新版本）；
+ * F7 变体寻优：POST /prompt/bandit（创建 Thompson Sampling 实验）、
+ *    GET /prompt/bandit（实验列表）、GET /prompt/bandit/get（后验分析：
+ *    P(best)/期望损失/95% CI）、POST /prompt/bandit/pull（执行采样轮次）、
+ *    DELETE /prompt/bandit（删除实验）；
+ * F8 静态分析：POST /prompt/lint（矛盾指令/占位符/模糊量词检测 + 复杂度
+ *    度量 + 健康分，零模型调用）。
  *
  * 命令 `prompt`：查看当前 Prompt 版本历史。
  */

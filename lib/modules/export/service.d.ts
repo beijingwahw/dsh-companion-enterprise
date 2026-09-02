@@ -17,7 +17,7 @@
 import { HttpError } from '../../core/http.js';
 import type { SessionQueryEngine, SessionId } from '../../types/harness.js';
 /** 导出格式。 */
-export type ExportFormat = 'markdown' | 'pdf' | 'json' | 'png';
+export type ExportFormat = 'markdown' | 'pdf' | 'json' | 'png' | 'html';
 /** 单次导出选项。 */
 export interface ExportOptions {
     /** 目标格式。 */
@@ -91,9 +91,7 @@ export declare function buildSingleExport(sessionQuery: SessionQueryEngine, sess
  */
 export declare function buildBatchExport(sessionQuery: SessionQueryEngine, sessionIds: readonly SessionId[], options: ExportOptions): Promise<ExportFilePayload>;
 /**
- * 将错误收敛为用户安全的 HttpError：
- * HttpError 原样透传；其余错误以通用文案包装，避免泄漏内部细节。
+ * 错误收敛与用户可读文案的统一实现已上移 core/http.ts
+ * （全插件唯一权威实现）；此处 re-export 保持既有导入路径兼容。
  */
-export declare function toSafeHttpError(error: unknown, fallbackMessage: string): HttpError;
-/** 提取命令面板可用的用户可读错误文本（不泄漏内部细节）。 */
-export declare function userFacingMessage(error: unknown, fallbackMessage: string): string;
+export { toSafeHttpError, userFacingMessage } from '../../core/http.js';

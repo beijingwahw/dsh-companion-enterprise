@@ -4,20 +4,26 @@
  *   （步骤名/耗时/Token 拆分/模型/缓存命中），支持按耗时或 Token 排序定位瓶颈；
  * - E2 异常标注：异常节点红色高亮，hover（title）显示原因与建议；
  * - E3 轨迹对比：选择两个会话对比差异，可导出 HTML 对比报告；
- * - E4 统计面板：汇总指标 + 近 14 天趋势（纯 div 条形图）+ 基准线对比。
+ * - E4 统计面板：汇总指标 + 近 14 天趋势（纯 div 条形图）+ 基准线对比；
+ * - E5 SPC 控制图：EWMA + Western Electric 规则监控指标漂移（纯 SVG 绘制，
+ *   支持指标/λ/限宽参数与三档判级横幅，GET /trace/spc）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactElement } from 'react'
-import { Button, Select, Spinner, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Input, Pill, Select, Spinner, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   deriveTrace,
   diffTraces,
   downloadBlob,
   fetchTraceSessions,
+  fetchTraceSpc,
   fetchTraceStats,
 } from '../api.js'
 import type {
   SessionRecord,
+  SpcMetric,
+  SpcPoint,
+  SpcResponse,
   TraceAnalysisResponse,
   TraceDiffEntry,
   TraceNode,
@@ -54,6 +60,190 @@ function kindLabel(kind: TraceNode['kind']): string {
   }
 }
 
+// ---------------------------------------------------------------------
+// E5 SPC 控制图（模块 E 创新扩展）
+// ---------------------------------------------------------------------
+
+/** SPC 查询区间（天）：视图无既有日期区间状态，固定近 28 天。 */
+const SPC_RANGE_DAYS = 28
+
+/** SPC 控制图高度（SVG viewBox 高度，px）。 */
+const SPC_CHART_HEIGHT = 220
+
+/** SPC 控制图四边留白（px）：左侧留给 y 轴刻度、底部留给日期标签。 */
+const SPC_CHART_PAD = { top: 14, right: 16, bottom: 30, left: 56 }
+
+/** SPC 指标下拉选项（value 对应 SpcMetric，label 为中文说明）。 */
+const SPC_METRIC_OPTIONS: ReadonlyArray<{ readonly value: SpcMetric; readonly label: string }> = [
+  { value: 'duration-per-trace', label: '单轮耗时' },
+  { value: 'tokens-per-trace', label: '单轮 Token' },
+  { value: 'anomaly-rate', label: '异常率' },
+  { value: 'cache-hit-rate', label: '缓存命中率' },
+  { value: 'tool-success-rate', label: '工具成功率' },
+]
+
+/** SPC 判级元数据：三档 verdict（受控/轻微异常/失控）的展示文案与样式类。 */
+const SPC_VERDICT_META: Readonly<
+  Record<SpcResponse['verdict'], { readonly text: string; readonly banner: string; readonly badge: string }>
+> = {
+  stable: { text: '受控', banner: styles.spcBannerStable, badge: styles.spcOkBadge },
+  warning: { text: '轻微异常', banner: styles.spcBannerWarning, badge: styles.spcWarnBadge },
+  'out-of-control': { text: '失控', banner: styles.spcBannerOoc, badge: styles.spcBadBadge },
+}
+
+/** 计算近 N 天的 [from, to] 日期区间（YYYY-MM-DD，本地时区近似）。 */
+function rangeOfDays(days: number): { from: string; to: string } {
+  const to = new Date()
+  const from = new Date(to.getTime() - (days - 1) * 86_400_000)
+  const fmt = (d: Date): string =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  return { from: fmt(from), to: fmt(to) }
+}
+
+/** SPC 查询区间（模块级常量：各次分析复用同一近 28 天区间）。 */
+const SPC_RANGE = rangeOfDays(SPC_RANGE_DAYS)
+
+/** SPC 指标值格式化：比率类显示百分比，耗时显示毫秒，Token 取整。 */
+function formatSpcValue(metric: SpcMetric, value: number): string {
+  if (metric === 'duration-per-trace') return `${Math.round(value)}ms`
+  if (metric === 'tokens-per-trace') return `${Math.round(value).toLocaleString('zh-CN')}`
+  return `${(value * 100).toFixed(2)}%`
+}
+
+/** SPC 控制图 props。 */
+interface SpcChartProps {
+  /** 查询区间内的控制图点（按日升序）。 */
+  readonly points: readonly SpcPoint[]
+  /** 中心线（Phase I 过程均值）。 */
+  readonly center: number
+  /** 监控指标（决定坐标轴与悬停文案的值格式化方式）。 */
+  readonly metric: SpcMetric
+}
+
+/**
+ * SPC 控制图（纯 SVG 绘制，不依赖图表库）：
+ * - value（细线）/ EWMA（粗线，主序列）/ ucl、lcl（虚线，随每日限宽收敛可呈折线）；
+ * - 中心线画水平点线；越限点标圆点（劣化侧红、改善侧橙）；
+ * - y 轴取全部序列 min/max 加 10% padding；悬停 title 显示日期/值/EWMA/上下限。
+ */
+function SpcChart(props: SpcChartProps): ReactElement {
+  const { points, center, metric } = props
+  const n = points.length
+
+  // 画布几何：宽度随点数自适应（每点至少 44px），高度固定 220。
+  const plotWidth = Math.max(560, n * 44)
+  const width = SPC_CHART_PAD.left + plotWidth + SPC_CHART_PAD.right
+  const height = SPC_CHART_HEIGHT
+  const plotTop = SPC_CHART_PAD.top
+  const plotBottom = height - SPC_CHART_PAD.bottom
+  const plotHeight = plotBottom - plotTop
+
+  // y 轴范围：全部序列（value/EWMA/ucl/lcl）的 min/max 加 10% padding；
+  // 全平序列（span=0）时按量级取 10% 作最小 padding，避免除零。
+  let lo = Number.POSITIVE_INFINITY
+  let hi = Number.NEGATIVE_INFINITY
+  for (const point of points) {
+    for (const value of [point.value, point.ewma, point.ucl, point.lcl]) {
+      if (value < lo) lo = value
+      if (value > hi) hi = value
+    }
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+    lo = 0
+    hi = 1
+  }
+  const span = hi - lo
+  const pad = span > 0 ? span * 0.1 : Math.max(Math.abs(hi) * 0.1, 1)
+  lo -= pad
+  hi += pad
+  const yOf = (value: number): number => plotTop + (1 - (value - lo) / (hi - lo)) * plotHeight
+  const xOf = (index: number): number =>
+    SPC_CHART_PAD.left + (n <= 1 ? plotWidth / 2 : (index / (n - 1)) * plotWidth)
+
+  /** 序列取值函数 → SVG 折线 path（M/L）。 */
+  const pathOf = (select: (point: SpcPoint) => number): string =>
+    points
+      .map((point, index) => `${index === 0 ? 'M' : 'L'}${xOf(index).toFixed(1)} ${yOf(select(point)).toFixed(1)}`)
+      .join(' ')
+
+  // 悬停命中区：每日一列（列宽 = 步长，最小 8px，首尾列向边缘拉伸）。
+  const hitWidth = Math.max(8, plotWidth / Math.max(1, n))
+  const hitX = (index: number): number =>
+    Math.min(Math.max(SPC_CHART_PAD.left, xOf(index) - hitWidth / 2), SPC_CHART_PAD.left + plotWidth - hitWidth)
+
+  // x 轴日期标签抽稀：最多约 14 个，避免重叠。
+  const labelStep = n <= 14 ? 1 : Math.ceil(n / 14)
+
+  // y 轴参考网格（上/中/下）与对应刻度值。
+  const gridYs = [plotTop, plotTop + plotHeight / 2, plotBottom]
+  const gridValues = [hi, (hi + lo) / 2, lo]
+
+  return (
+    <svg className={styles.spcChart} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="SPC 控制图">
+      {/* 网格线 + y 轴刻度 */}
+      {gridYs.map((y, index) => (
+        <line
+          key={`grid-${index}`}
+          x1={SPC_CHART_PAD.left}
+          y1={y}
+          x2={SPC_CHART_PAD.left + plotWidth}
+          y2={y}
+          className={styles.spcGrid}
+        />
+      ))}
+      {gridYs.map((y, index) => (
+        <text key={`ytick-${index}`} x={SPC_CHART_PAD.left - 6} y={y + 3} textAnchor="end" className={styles.spcAxisText}>
+          {formatSpcValue(metric, gridValues[index])}
+        </text>
+      ))}
+      {/* 上/下控制限（虚线；每日限宽不同故为折线） */}
+      <path d={pathOf((point) => point.ucl)} className={styles.spcLineLimit} />
+      <path d={pathOf((point) => point.lcl)} className={styles.spcLineLimit} />
+      {/* 中心线（水平点线） */}
+      <line
+        x1={SPC_CHART_PAD.left}
+        y1={yOf(center)}
+        x2={SPC_CHART_PAD.left + plotWidth}
+        y2={yOf(center)}
+        className={styles.spcLineCenter}
+      />
+      {/* 原始值（细线折线） */}
+      <path d={pathOf((point) => point.value)} className={styles.spcLineValue} />
+      {/* EWMA（主序列，粗折线） */}
+      <path d={pathOf((point) => point.ewma)} className={styles.spcLineEwma} />
+      {/* 越限点：劣化侧红色实心、改善侧橙色 */}
+      {points.map((point, index) =>
+        point.violation ? (
+          <circle
+            key={`violation-${point.day}`}
+            cx={xOf(index)}
+            cy={yOf(point.ewma)}
+            r={4}
+            className={point.badSide ? styles.spcDotBad : styles.spcDotWarn}
+          />
+        ) : null,
+      )}
+      {/* x 轴日期标签（MM-DD） */}
+      {points.map((point, index) =>
+        index % labelStep === 0 ? (
+          <text key={`xlabel-${point.day}`} x={xOf(index)} y={height - 8} textAnchor="middle" className={styles.spcAxisText}>
+            {point.day.slice(5)}
+          </text>
+        ) : null,
+      )}
+      {/* 悬停命中区（覆盖全高，title 显示日期/值/EWMA/上下限） */}
+      {points.map((point, index) => (
+        <rect key={`hit-${point.day}`} x={hitX(index)} y={plotTop} width={hitWidth} height={plotHeight} className={styles.spcHover}>
+          <title>
+            {`${point.day}：值 ${formatSpcValue(metric, point.value)} / EWMA ${formatSpcValue(metric, point.ewma)} / 上限 ${formatSpcValue(metric, point.ucl)} / 下限 ${formatSpcValue(metric, point.lcl)}`}
+            {point.violation ? `（越限${point.badSide ? '，劣化侧' : '，改善侧'}）` : ''}
+          </title>
+        </rect>
+      ))}
+    </svg>
+  )
+}
+
 /** 执行轨迹分析器视图页。 */
 export function TraceAnalyzerView(props: TraceAnalyzerViewProps): ReactElement {
   const [sessions, setSessions] = useState<readonly SessionRecord[]>([])
@@ -71,10 +261,21 @@ export function TraceAnalyzerView(props: TraceAnalyzerViewProps): ReactElement {
   // 统计面板（E4）
   const [stats, setStats] = useState<TraceStatsResponse | undefined>()
 
+  // SPC 控制图（E5 创新扩展）
+  const [spcMetric, setSpcMetric] = useState<SpcMetric>('duration-per-trace')
+  const [spcLambdaInput, setSpcLambdaInput] = useState('0.3')
+  const [spcLimitInput, setSpcLimitInput] = useState('3')
+  const [spc, setSpc] = useState<SpcResponse | undefined>()
+  const [spcLoading, setSpcLoading] = useState(false)
+  const [spcError, setSpcError] = useState('')
+
   // 卸载守卫 + 请求序号：防止过期响应覆盖新结果、卸载后 setState。
   const mountedRef = useRef(true)
   const analyzeSeq = useRef(0)
   const diffSeq = useRef(0)
+  const spcSeq = useRef(0)
+  /** 挂载预载守卫：SPC 首次分析只执行一次。 */
+  const spcInitRef = useRef(false)
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -181,6 +382,46 @@ export function TraceAnalyzerView(props: TraceAnalyzerViewProps): ReactElement {
       setDiffLoading(false)
     }
   }, [selectedSession, compareSession])
+
+  /** 执行 SPC 控制图分析（E5）：校验 λ 与限宽后请求 /trace/spc；序号守卫丢弃过期响应。 */
+  const runSpc = useCallback(async (): Promise<void> => {
+    const lambda = Number(spcLambdaInput)
+    const limitWidth = Number(spcLimitInput)
+    if (!Number.isFinite(lambda) || lambda < 0.05 || lambda > 0.95) {
+      Toast.push('λ 需为 0.05~0.95 之间的数值', 'warning')
+      return
+    }
+    if (!Number.isFinite(limitWidth) || limitWidth < 1 || limitWidth > 5) {
+      Toast.push('控制限宽度需为 1~5 之间的数值', 'warning')
+      return
+    }
+    const seq = ++spcSeq.current
+    setSpcLoading(true)
+    setSpcError('')
+    try {
+      const response = await fetchTraceSpc({
+        from: SPC_RANGE.from,
+        to: SPC_RANGE.to,
+        metric: spcMetric,
+        lambda,
+        limitWidth,
+      })
+      if (mountedRef.current && seq === spcSeq.current) setSpc(response)
+    } catch (err) {
+      if (mountedRef.current && seq === spcSeq.current) {
+        setSpcError(err instanceof Error ? err.message : 'SPC 分析失败')
+      }
+    } finally {
+      if (mountedRef.current && seq === spcSeq.current) setSpcLoading(false)
+    }
+  }, [spcMetric, spcLambdaInput, spcLimitInput])
+
+  // 挂载时按缺省参数预载一次 SPC 控制图（ref 守卫确保只执行一次）。
+  useEffect(() => {
+    if (spcInitRef.current) return
+    spcInitRef.current = true
+    void runSpc()
+  }, [runSpc])
 
   // 时间轴节点排序：time=按开始时间，duration=按耗时降序，tokens=按 Token 降序
   const timelineNodes: readonly TraceNode[] = (() => {
@@ -413,6 +654,103 @@ export function TraceAnalyzerView(props: TraceAnalyzerViewProps): ReactElement {
           )}
         </section>
       )}
+
+      {/* E5 SPC 控制图：EWMA + Western Electric 规则的漂移检测 */}
+      <section className={styles.section}>
+        <h3>SPC 控制图</h3>
+        <div className={styles.toolbar}>
+          <Select value={spcMetric} onChange={(event) => setSpcMetric(event.target.value as SpcMetric)}>
+            {SPC_METRIC_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </Select>
+          <label className={styles.spcField}>
+            λ（0.05~0.95）
+            <Input
+              className={styles.spcInput}
+              type="number"
+              value={spcLambdaInput}
+              onChange={(event) => setSpcLambdaInput(event.target.value)}
+              placeholder="0.3"
+            />
+          </label>
+          <label className={styles.spcField}>
+            限宽（1~5σ）
+            <Input
+              className={styles.spcInput}
+              type="number"
+              value={spcLimitInput}
+              onChange={(event) => setSpcLimitInput(event.target.value)}
+              placeholder="3"
+            />
+          </label>
+          <Button variant="primary" size="sm" disabled={spcLoading} onClick={() => void runSpc()}>
+            {spcLoading ? '分析中…' : '分析'}
+          </Button>
+        </div>
+        <p className={styles.spcHint}>
+          λ 越小对缓慢漂移越灵敏；控制限基于全量历史估计，图表仅显示查询区间（近 {SPC_RANGE_DAYS} 天）。
+        </p>
+        {spcError.length > 0 && <div className={styles.error}>{spcError}</div>}
+        {spcLoading ? (
+          <Spinner label="SPC 分析中…" />
+        ) : spc ? (
+          spc.sampleDays < 5 ? (
+            <p className={styles.empty}>有效样本不足 5 天，继续积累后可用</p>
+          ) : (
+            <>
+              {/* 判级横幅：受控/轻微异常/失控 + 漂移说明 + EWMA 斜率 */}
+              <div className={`${styles.spcBanner} ${SPC_VERDICT_META[spc.verdict].banner}`}>
+                <Pill className={SPC_VERDICT_META[spc.verdict].badge}>{SPC_VERDICT_META[spc.verdict].text}</Pill>
+                <span className={styles.spcDetail}>{spc.drift.detail}</span>
+                <span className={styles.spcRate}>
+                  EWMA 斜率 {spc.driftRatePerDay > 0 ? '+' : ''}
+                  {spc.driftRatePerDay.toFixed(4)}/天
+                  {spc.driftRatePerDay > 0 ? '（恶化）' : spc.driftRatePerDay < 0 ? '（改善）' : ''}
+                </span>
+              </div>
+              {/* 中心线 / σ / 样本天数 */}
+              <p className={styles.spcStats}>
+                中心线 {formatSpcValue(spc.metric, spc.center)} · σ {formatSpcValue(spc.metric, spc.sigma)} · 样本{' '}
+                {spc.sampleDays} 天
+              </p>
+              {spc.points.length === 0 ? (
+                <p className={styles.empty}>查询区间内暂无数据</p>
+              ) : (
+                <>
+                  <div className={styles.spcChartWrap}>
+                    <SpcChart points={spc.points} center={spc.center} metric={spc.metric} />
+                  </div>
+                  <div className={styles.spcLegend}>
+                    <span>
+                      <i className={`${styles.spcLegendDot} ${styles.spcLegendValue}`} />
+                      原始值
+                    </span>
+                    <span>
+                      <i className={`${styles.spcLegendDot} ${styles.spcLegendEwma}`} />
+                      EWMA
+                    </span>
+                    <span>
+                      <i className={`${styles.spcLegendDot} ${styles.spcLegendLimit}`} />
+                      上/下控制限
+                    </span>
+                    <span>
+                      <i className={`${styles.spcLegendDot} ${styles.spcLegendCenter}`} />
+                      中心线
+                    </span>
+                    <span>
+                      <i className={`${styles.spcLegendDot} ${styles.spcLegendViolation}`} />
+                      越限点（红=劣化侧，橙=改善侧）
+                    </span>
+                  </div>
+                </>
+              )}
+            </>
+          )
+        ) : null}
+      </section>
     </div>
   )
 }

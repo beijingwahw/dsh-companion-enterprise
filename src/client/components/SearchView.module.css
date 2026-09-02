@@ -134,3 +134,150 @@
   justify-content: center;
   padding: 8px 0;
 }
+
+/* ---- 语义检索模式（模块 D 创新扩展：shingle 邻域 + PRF 扩展 + RRF 融合）---- */
+
+.modeSwitch {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.semanticHint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px dashed var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 8px;
+}
+
+.semanticExpansion {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.semanticExpansionLabel {
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticExpansionItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.semanticExpansionTerm {
+  color: var(--dsw-alias-brand-default, #4d6bfe);
+}
+
+.semanticExpansionWeight {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticScanned {
+  font-size: 12px;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.semanticItemBar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.semanticBadges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 8px;
+  white-space: nowrap;
+}
+
+.semanticScore {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticSimPill {
+  background: var(--dsw-alias-brand-default, #4d6bfe);
+  color: var(--dsw-alias-text-inverse, #ffffff);
+}
+
+.semanticMatched {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.semanticMatchedLabel {
+  font-size: 11px;
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.semanticMatchedTerm {
+  background: var(--dsw-alias-bg-hover, #eef0f3);
+  color: var(--dsw-alias-text-secondary, #646a73);
+}
+
+.similarBox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-hover, #eef0f3);
+}
+
+.similarHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.similarHead > :first-child {
+  flex: 1;
+}
+
+.similarTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-text-primary, #1f2329);
+}
+
+.similarItem {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  text-align: left;
+  border: 1px solid var(--dsw-alias-border-default, #dee0e3);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-surface, #ffffff);
+  cursor: pointer;
+}
+
+.similarItem:hover {
+  border-color: var(--dsw-alias-brand-default, #4d6bfe);
+}

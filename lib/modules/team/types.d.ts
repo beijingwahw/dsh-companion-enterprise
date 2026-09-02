@@ -102,8 +102,8 @@ export interface SectionReport {
     /** 跳过/失败原因（如成本模块未启用）。 */
     readonly message?: string;
 }
-/** 执行卡片来源。 */
-export type ExperienceSource = 'pipeline' | 'queue' | 'cron' | 'manual';
+/** 执行卡片来源（'session' = 经验自动蒸馏晋升）。 */
+export type ExperienceSource = 'pipeline' | 'queue' | 'cron' | 'manual' | 'session';
 /** 问题与解决方案笔记（用户手动补充）。 */
 export interface ExperienceNote {
     readonly problem: string;

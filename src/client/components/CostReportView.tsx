@@ -3,6 +3,8 @@
  * - GET /cost/state 与 GET /cost/report?from&to（默认近 7 天，可切换 7/28 天）；
  * - 开发者模式总开关与 API Key 管理（type=password 输入 + 保存/删除/测试连接）；
  * - 峰谷调度、模型路由开关与日/月双档预算（POST /cost/settings 稀疏补丁）；
+ * - 自适应路由开关与学习状态面板（UCB1 多臂赌博机，GET /cost/adaptive 读取、
+ *   POST /cost/adaptive/reset 重置，按 simple/complex 两类任务分别展示赌臂统计）；
  * - 预算进度条（spent/budget，80% 黄、100% 红）；
  * - 动态计价信息区：定价来源（官方实时/内置快照）、抓取时间、峰谷计划，
  *   支持手动触发官方定价页刷新（POST /cost/pricing/refresh）；
@@ -21,15 +23,23 @@ import {
   Toast,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
+  fetchCostAdaptive,
   fetchCostReport,
   fetchCostState,
   refreshCostPricing,
   removeCostApiKey,
+  resetCostAdaptive,
   saveCostApiKey,
   testCostCall,
   updateCostSettings,
 } from '../api.js'
-import type { CostReportResponse, CostSettingsPatch, CostState } from '../api.js'
+import type {
+  AdaptiveArmReport,
+  CostAdaptiveResponse,
+  CostReportResponse,
+  CostSettingsPatch,
+  CostState,
+} from '../api.js'
 import styles from './CostReportView.module.css'
 
 /** 组件 props：sessionId 由 slot 的 inject 注入（本视图不使用，仅为统一注入约定）。 */
@@ -74,6 +84,7 @@ function isCostStateEqual(prev: CostState, next: CostState): boolean {
     prev.apiKeyConfigured === next.apiKeyConfigured &&
     prev.peakScheduling === next.peakScheduling &&
     prev.modelRouting === next.modelRouting &&
+    prev.adaptiveRouting === next.adaptiveRouting &&
     prev.budget.dailyCny === next.budget.dailyCny &&
     prev.budget.dailySpentCny === next.budget.dailySpentCny &&
     prev.budget.dailyRatio === next.budget.dailyRatio &&
@@ -105,6 +116,88 @@ function isScheduledEqual(
   return true
 }
 
+/** 自适应路由赌臂子表 props。 */
+interface AdaptiveArmTableProps {
+  /** 任务难度类别展示名（简单/复杂）。 */
+  readonly title: string
+  /** 该类别的赌臂统计（服务端按均值奖励降序返回）。 */
+  readonly arms: readonly AdaptiveArmReport[]
+  /** 该表是否正在执行重置。 */
+  readonly resetting: boolean
+  /** 重置该类别的学习状态（内部自行 confirm 确认）。 */
+  readonly onReset: () => void
+}
+
+/**
+ * 自适应路由赌臂子表：simple/complex 共用。
+ * 展示各候选模型的拉臂次数、均值奖励、延迟、成本、失败率与 UCB 置信上界；
+ * 均值奖励最高（且有实际拉臂）的行高亮并标注「当前最优」。
+ */
+function AdaptiveArmTable(props: AdaptiveArmTableProps): ReactElement {
+  const { arms } = props
+  // 当前最优：有实际拉臂（pulls>0）的臂中均值奖励最高者；无观测时不标注。
+  let bestModel = ''
+  let bestReward = -Number.POSITIVE_INFINITY
+  for (const arm of arms) {
+    if (arm.pulls > 0 && arm.meanReward > bestReward) {
+      bestReward = arm.meanReward
+      bestModel = arm.model
+    }
+  }
+  return (
+    <div className={styles.subSection}>
+      <div className={styles.armHeader}>
+        <span className={styles.subTitle}>
+          {props.title}任务赌臂（{arms.length} 个模型）
+        </span>
+        <Button variant="danger" size="sm" disabled={props.resetting} onClick={props.onReset}>
+          {props.resetting ? <Spinner label="重置中…" /> : '重置学习状态'}
+        </Button>
+      </div>
+      {arms.length === 0 ? (
+        <div className={styles.hint}>暂无学习数据：产生调用后自动累积</div>
+      ) : (
+        <div className={styles.armTableWrap}>
+          <table className={styles.armTable}>
+            <thead>
+              <tr>
+                <th className={styles.armHead}>模型</th>
+                <th className={styles.armHead}>拉臂次数</th>
+                <th className={styles.armHead}>均值奖励</th>
+                <th className={styles.armHead}>平均延迟</th>
+                <th className={styles.armHead}>平均成本</th>
+                <th className={styles.armHead}>失败率</th>
+                <th className={styles.armHead}>UCB 值</th>
+                <th className={styles.armHead}>最近使用</th>
+              </tr>
+            </thead>
+            <tbody>
+              {arms.map((arm) => (
+                <tr
+                  key={arm.model}
+                  className={arm.model === bestModel ? `${styles.armRow} ${styles.armHighlight}` : styles.armRow}
+                >
+                  <td>
+                    {arm.model}
+                    {arm.model === bestModel ? <Pill className={styles.bestBadge}>当前最优</Pill> : null}
+                  </td>
+                  <td>{arm.pulls}</td>
+                  <td>{arm.meanReward.toFixed(3)}</td>
+                  <td>{arm.avgLatencyMs}ms</td>
+                  <td>{formatCny(arm.avgCostCny)}</td>
+                  <td>{(arm.failureRate * 100).toFixed(1)}%</td>
+                  <td>{arm.ucb === null ? '-' : arm.ucb.toFixed(3)}</td>
+                  <td>{arm.lastUsedAt === undefined ? '-' : new Date(arm.lastUsedAt).toLocaleString('zh-CN')}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** 成本报表视图页。 */
 export function CostReportView(_props: CostReportViewProps): ReactElement {
   const [costState, setCostState] = useState<CostState | null>(null)
@@ -121,6 +214,15 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
   const [dailyBudgetInput, setDailyBudgetInput] = useState('')
   const [savingSettings, setSavingSettings] = useState(false)
   const [refreshingPricing, setRefreshingPricing] = useState(false)
+
+  // 自适应路由学习状态（模块 C 创新扩展）
+  const [adaptive, setAdaptive] = useState<CostAdaptiveResponse | null>(null)
+  const [adaptiveLoading, setAdaptiveLoading] = useState(false)
+  const [adaptiveError, setAdaptiveError] = useState('')
+  /** 正在重置的类别（null=无）。 */
+  const [resettingCls, setResettingCls] = useState<'simple' | 'complex' | null>(null)
+  /** 重置成功后的自增计数：变化触发学习状态重新加载。 */
+  const [adaptiveNonce, setAdaptiveNonce] = useState(0)
 
   /** 上一次观察到的 paused 状态；null 表示尚未建立基线。 */
   const pausedRef = useRef<boolean | null>(null)
@@ -192,6 +294,41 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
     }
   }, [rangeDays])
 
+  // ---------------------------------------------------------------------
+  // 自适应路由学习状态（模块 C 创新扩展）
+  // ---------------------------------------------------------------------
+
+  /** 学习状态面板可见：成本状态已加载且开发者模式开启。 */
+  const showAdaptivePanel = costState !== null && costState.devMode
+  /** 自适应学习是否生效（enabled = modelRouting && adaptiveRouting）：切换后触发重新加载。 */
+  const adaptiveRoutingOn = costState?.modelRouting === true && costState?.adaptiveRouting === true
+
+  // 拉取自适应路由学习状态：面板可见时加载；开关切换或重置后（nonce 变化）重新加载。
+  // cancelled 守卫 + abort：卸载或依赖变化时旧响应不会覆盖新结果。
+  useEffect(() => {
+    if (!showAdaptivePanel) return
+    const controller = new AbortController()
+    let cancelled = false
+    setAdaptiveLoading(true)
+    fetchCostAdaptive({ signal: controller.signal })
+      .then((response) => {
+        if (!cancelled) {
+          setAdaptive(response)
+          setAdaptiveError('')
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setAdaptiveError(error instanceof Error ? error.message : '自适应路由状态加载失败')
+      })
+      .finally(() => {
+        if (!cancelled) setAdaptiveLoading(false)
+      })
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [showAdaptivePanel, adaptiveRoutingOn, adaptiveNonce])
+
   /** 提交设置补丁并刷新状态。 */
   const applySettings = useCallback(
     async (patch: CostSettingsPatch, successMessage: string): Promise<void> => {
@@ -209,19 +346,40 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
     [loadState],
   )
 
-  /** 切换布尔设置（开发者模式 / 峰谷调度 / 模型路由）。 */
+  /** 切换布尔设置（开发者模式 / 峰谷调度 / 模型路由 / 自适应路由）。 */
   const handleToggle = useCallback(
-    (key: 'devMode' | 'peakScheduling' | 'modelRouting', value: boolean): void => {
+    (
+      key: 'devMode' | 'peakScheduling' | 'modelRouting' | 'adaptiveRouting',
+      value: boolean,
+    ): void => {
       const patch: CostSettingsPatch =
         key === 'devMode'
           ? { devMode: value }
           : key === 'peakScheduling'
             ? { peakScheduling: value }
-            : { modelRouting: value }
+            : key === 'modelRouting'
+              ? { modelRouting: value }
+              : { adaptiveRouting: value }
       void applySettings(patch, '设置已更新')
     },
     [applySettings],
   )
+
+  /** 重置指定类别（simple/complex）的自适应路由学习状态：confirm 确认后调用，成功后重新加载。 */
+  const handleResetAdaptive = useCallback(async (cls: 'simple' | 'complex'): Promise<void> => {
+    const clsText = cls === 'simple' ? '简单任务' : '复杂任务'
+    if (!window.confirm(`确定清空「${clsText}」的自适应路由学习状态？该操作不可恢复。`)) return
+    setResettingCls(cls)
+    try {
+      await resetCostAdaptive(cls)
+      Toast.push(`${clsText}学习状态已重置`, 'success')
+      setAdaptiveNonce((value) => value + 1)
+    } catch (error) {
+      Toast.push(error instanceof Error ? error.message : '学习状态重置失败', 'error')
+    } finally {
+      setResettingCls(null)
+    }
+  }, [])
 
   /** 保存月度预算。 */
   const handleSaveBudget = useCallback((): void => {
@@ -633,6 +791,12 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
                     onChange={(checked) => handleToggle('modelRouting', checked)}
                     label="模型路由（按任务复杂度选择更经济的模型）"
                   />
+                  <Checkbox
+                    checked={costState.adaptiveRouting}
+                    disabled={savingSettings}
+                    onChange={(checked) => handleToggle('adaptiveRouting', checked)}
+                    label="自适应路由（UCB1 赌博机从调用结果中学习最优模型）"
+                  />
                 </div>
               </>
             )}
@@ -649,6 +813,50 @@ export function CostReportView(_props: CostReportViewProps): ReactElement {
           <Spinner label="加载成本状态…" />
         )}
       </div>
+
+      {/* 自适应路由学习状态（模块 C 创新扩展）：成本状态已加载且开发者模式开启时显示 */}
+      {showAdaptivePanel ? (
+        <div className={styles.section}>
+          <h3 className={styles.sectionTitle}>自适应路由学习状态</h3>
+
+          {/* 顶部状态行：学习引擎开关状态 */}
+          <div className={styles.statusRow}>
+            学习引擎：
+            {adaptiveLoading && adaptive === null ? (
+              <Spinner label="加载学习状态…" />
+            ) : adaptive?.enabled ? (
+              <Pill className={styles.okBadge}>已开启</Pill>
+            ) : (
+              <Pill className={styles.warnBadge}>未开启</Pill>
+            )}
+            <span className={styles.hint}>
+              UCB1 多臂赌博机从调用结果中学习最优模型（观测保留最近 50 次，陈旧价格与版本影响会被自然遗忘）。
+            </span>
+          </div>
+          {adaptive !== null && !adaptive.enabled ? (
+            <div className={styles.hint}>开启模型路由与自适应路由后开始学习</div>
+          ) : null}
+          {adaptiveError ? <div className={styles.error}>{adaptiveError}</div> : null}
+
+          {/* simple/complex 两类任务各自的赌臂统计 */}
+          {adaptive !== null ? (
+            <>
+              <AdaptiveArmTable
+                title="简单"
+                arms={adaptive.arms.simple}
+                resetting={resettingCls === 'simple'}
+                onReset={() => void handleResetAdaptive('simple')}
+              />
+              <AdaptiveArmTable
+                title="复杂"
+                arms={adaptive.arms.complex}
+                resetting={resettingCls === 'complex'}
+                onReset={() => void handleResetAdaptive('complex')}
+              />
+            </>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   )
 }

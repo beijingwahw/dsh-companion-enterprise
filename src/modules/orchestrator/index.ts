@@ -10,7 +10,13 @@
  * H3 批量队列：GET/POST /orchestrator/queue、POST /orchestrator/queue/cancel、
  *    /pause、/resume、DELETE /orchestrator/queue、GET /orchestrator/queue/counts；
  * H4 定时调度：GET/POST /orchestrator/jobs、DELETE /orchestrator/jobs、
- *    GET /orchestrator/jobs/runs、POST /orchestrator/parse-schedule（自然语言 → Cron）。
+ *    GET /orchestrator/jobs/runs、POST /orchestrator/parse-schedule（自然语言 → Cron）；
+ * 自愈执行：GET /orchestrator/circuits（模型断路器全景：closed/open/half-open）；
+ * DAG 规划：POST /orchestrator/dag（拓扑分层 + 关键路径 + 优化建议）；
+ * 蒙特卡洛模拟：POST /orchestrator/monte（PERT 三点估算 + P50/P90 工期置信区间
+ *    + 步骤关键性指数，iterations/parallelism 可选）；
+ * 关键路径分析：POST /orchestrator/cpm（CPM ES/EF/LS/LF/松弛 + 并发峰值画像
+ *    + 并行化收益 + 瓶颈步骤，durationOverrides 可选）。
  *
  * 命令 `tasks`：查看队列与定时任务概览。
  */
@@ -18,7 +24,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import { HttpError, sendJson } from '../../core/http.js'
 import type { CommandInvocation, CommandResult } from '../../types/harness.js'
 import { naturalLanguageToCron, nextCronFire, parseCron } from './cron.js'
+import { planDag } from './dag.js'
+import { simulatePipeline } from './monte.js'
+import { analyzeCriticalPath } from './cpm.js'
 import { CronTicker, PipelineEngine, QueueWorker, pipelineToYaml, shortId, validatePipeline } from './engine.js'
+import { CircuitBreaker } from './selfheal.js'
 import { PipelineRunStore, PipelineStore, QueueTaskStore, ScheduledJobStore, ScheduledRunStore } from './store.js'
 import type { Pipeline, PipelineStep, QueueTask } from './types.js'
 
@@ -61,9 +71,12 @@ export function apply(ctx: Context): void {
       }
     }
 
-    const engine = new PipelineEngine(ctx, runs, call, ctx.companion.config.apiTimeoutMs)
-    const worker = new QueueWorker(ctx, tasks, call, ctx.companion.config.apiTimeoutMs)
-    const ticker = new CronTicker(ctx, jobs, jobRuns, call, ctx.companion.config.apiTimeoutMs)
+    // 共享模型断路器：流水线/队列/定时调度对同一模型的故障信号互通，
+    // 任一路径连续失败都会熔断该模型，其余路径自动避让（自愈执行核心）。
+    const breaker = new CircuitBreaker(5, 60_000)
+    const engine = new PipelineEngine(ctx, runs, call, ctx.companion.config.apiTimeoutMs, breaker)
+    const worker = new QueueWorker(ctx, tasks, call, ctx.companion.config.apiTimeoutMs, breaker)
+    const ticker = new CronTicker(ctx, jobs, jobRuns, call, ctx.companion.config.apiTimeoutMs, breaker)
 
     try {
       ctx.effect(() => {
@@ -389,6 +402,112 @@ export function apply(ctx: Context): void {
           }),
 
           // --------------------------------------------------------------
+          // 自愈执行：模型断路器全景（创新扩展）
+          // --------------------------------------------------------------
+          ctx.companion.http.add('GET', '/orchestrator/circuits', (_req, res) => {
+            const circuits = breaker.snapshot()
+            sendJson(res, 200, {
+              circuits,
+              legend: {
+                closed: '正常放行',
+                open: `连续失败熔断中（冷却 60s，期间流水线/队列/定时任务自动避让该模型）`,
+                'half-open': '冷却结束，放行单个探针调用验证恢复',
+              },
+            })
+          }),
+
+          // --------------------------------------------------------------
+          // DAG 规划器：拓扑分层 + 关键路径（创新扩展）
+          // --------------------------------------------------------------
+          // POST /orchestrator/dag {pipelineId}：校验依赖图并输出
+          // 并行层 / 关键路径 / 理论工期 / 优化建议。
+          ctx.companion.http.add('POST', '/orchestrator/dag', async (_req, res, hctx) => {
+            const body =
+              typeof hctx.body === 'object' && hctx.body !== null && !Array.isArray(hctx.body)
+                ? (hctx.body as Record<string, unknown>)
+                : {}
+            const pipelineId = typeof body.pipelineId === 'string' ? body.pipelineId : ''
+            const pipeline = pipelines.get(pipelineId)
+            if (!pipeline) throw new HttpError('流水线不存在', 404)
+            sendJson(res, 200, planDag(pipeline, runs.forPipeline(pipelineId)))
+          }),
+
+          // --------------------------------------------------------------
+          // 蒙特卡洛工期模拟：PERT 三点估算 + P50/P90 置信区间（创新扩展）
+          // --------------------------------------------------------------
+          // POST /orchestrator/monte {pipelineId, iterations?, parallelism?}：
+          // 从历史运行提取每步 a/m/b 三点估算，蒙特卡洛抽样输出
+          // 总工期分位数（P50/P80/P90/P95/P99）与各步关键性指数。
+          ctx.companion.http.add('POST', '/orchestrator/monte', async (_req, res, hctx) => {
+            const body =
+              typeof hctx.body === 'object' && hctx.body !== null && !Array.isArray(hctx.body)
+                ? (hctx.body as Record<string, unknown>)
+                : {}
+            const pipelineId = typeof body.pipelineId === 'string' ? body.pipelineId : ''
+            const pipeline = pipelines.get(pipelineId)
+            if (!pipeline) throw new HttpError('流水线不存在', 404)
+            const iterations =
+              Number.isFinite(Number(body.iterations)) && Number(body.iterations) > 0
+                ? Number(body.iterations)
+                : undefined
+            const parallelismRaw = Number(body.parallelism)
+            const parallelism =
+              Number.isFinite(parallelismRaw) && parallelismRaw > 0
+                ? Math.floor(parallelismRaw)
+                : null
+            sendJson(
+              res,
+              200,
+              simulatePipeline(pipeline, runs.forPipeline(pipelineId), {
+                iterations,
+                parallelism,
+              }),
+            )
+          }),
+
+          // --------------------------------------------------------------
+          // 关键路径分析：CPM + 并发画像 + 资源争用（创新扩展）
+          // --------------------------------------------------------------
+          // POST /orchestrator/cpm {pipelineId, durationOverrides?}：
+          // 历史中位工期上的确定性关键路径（ES/EF/LS/LF/松弛）、
+          // 并发峰值画像与并行化收益、瓶颈步骤与压缩建议。
+          ctx.companion.http.add('POST', '/orchestrator/cpm', async (_req, res, hctx) => {
+            const body =
+              typeof hctx.body === 'object' && hctx.body !== null && !Array.isArray(hctx.body)
+                ? (hctx.body as Record<string, unknown>)
+                : {}
+            const pipelineId = typeof body.pipelineId === 'string' ? body.pipelineId : ''
+            const pipeline = pipelines.get(pipelineId)
+            if (!pipeline) throw new HttpError('流水线不存在', 404)
+            let durationOverrides: Record<string, number> | undefined
+            if (
+              typeof body.durationOverrides === 'object' &&
+              body.durationOverrides !== null &&
+              !Array.isArray(body.durationOverrides)
+            ) {
+              durationOverrides = {}
+              for (const [stepId, value] of Object.entries(
+                body.durationOverrides as Record<string, unknown>,
+              )) {
+                const ms = Number(value)
+                if (!Number.isFinite(ms) || ms <= 0) {
+                  throw new HttpError(`durationOverrides.${stepId} 必须是正数（毫秒）`, 400)
+                }
+                durationOverrides[stepId] = ms
+              }
+            }
+            sendJson(
+              res,
+              200,
+              analyzeCriticalPath(
+                pipeline,
+                runs.forPipeline(pipelineId),
+                durationOverrides ? { durationOverrides } : {},
+              ),
+            )
+          }),
+
+          // --------------------------------------------------------------
           // 命令面板
           // --------------------------------------------------------------
           ctx.commands.register({
@@ -463,6 +582,8 @@ function parseSteps(raw: unknown): PipelineStep[] {
       maxRetries: Number.isInteger(Number(record.maxRetries)) && Number(record.maxRetries) > 0 ? Number(record.maxRetries) : 0,
       retryIntervalMs: Number(record.retryIntervalMs) > 0 ? Number(record.retryIntervalMs) : 2_000,
       dependsOn,
+      fallbackModel:
+        typeof record.fallbackModel === 'string' && record.fallbackModel.trim() ? record.fallbackModel.trim() : '',
     } satisfies PipelineStep
   })
 }

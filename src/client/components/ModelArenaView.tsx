@@ -3,23 +3,37 @@
  * - G1 并行对比：输入 Prompt 勾选模型（最多 5 个），表格并排展示输出/耗时/Token/费用；
  * - G2 批量评测排行榜：导入 JSON/JSONL 测试集，跑完整评测并导出 MD/HTML 报告；
  * - G3 模型推荐：任务类型 + 预算 + 延迟要求 → 推荐排序与理由；
+ * - 金丝雀漂移监控：确定性探针比对基线，延迟/通过率/长度/风格四维度漂移检测与基线重置；
  * - 外部厂商 Key 管理（加密保存，不回传明文）。
  */
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactElement } from 'react'
-import { Button, Checkbox, Input, Select, Spinner, Textarea, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, Input, Pill, Select, Spinner, Textarea, Toast } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   addArenaCustomModel,
   downloadBlob,
   fetchArenaModels,
   fetchArenaRecommendation,
+  fetchCanaryOverview,
+  fetchCanaryReport,
   removeArenaCustomModel,
   removeArenaKey,
+  resetCanaryBaseline,
   runArenaCompare,
   runArenaLeaderboard,
+  runCanaryProbes,
   saveArenaKey,
 } from '../api.js'
-import type { ArenaLeaderboardRow, ArenaModelInfo, ArenaRecommendation, ArenaRunResult } from '../api.js'
+import type {
+  ArenaLeaderboardRow,
+  ArenaModelInfo,
+  ArenaRecommendation,
+  ArenaRunResult,
+  CanaryModelReport,
+  CanaryOverviewResponse,
+  DriftDimension,
+  DriftReport,
+} from '../api.js'
 import styles from './ModelArenaView.module.css'
 
 /** 组件 props。 */
@@ -39,8 +53,34 @@ function peakBadge(model: ArenaModelInfo): string {
   return status.isPeak ? '（高峰价）' : '（空闲价）'
 }
 
+/** 漂移判定级别（报告级 verdict 与维度级 level 共用）。 */
+type DriftLevel = DriftReport['verdict']
+
+/** 漂移概览行（全部受监控模型摘要）。 */
+type CanaryOverviewRow = CanaryOverviewResponse['models'][number]
+
+/** 漂移级别 → 中文标签与 Pill 配色类（stable=绿 / warning=黄 / drifted=红）。 */
+const DRIFT_LEVEL_META: Readonly<Record<DriftLevel, { label: string; cls: string }>> = {
+  stable: { label: '稳定', cls: styles.driftPillStable },
+  warning: { label: '预警', cls: styles.driftPillWarning },
+  drifted: { label: '漂移', cls: styles.driftPillDrifted },
+}
+
+/** 漂移维度 → 中文名。 */
+const DRIFT_DIMENSION_LABELS: Readonly<Record<DriftDimension['name'], string>> = {
+  latency: '延迟分布',
+  'pass-rate': '通过率',
+  length: '输出长度',
+  style: '风格指纹',
+}
+
+/** 格式化毫秒时间戳（本地时区、24 小时制）。 */
+function formatTimestamp(ts: number): string {
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false })
+}
+
 /** 子面板页签。 */
-type Tab = 'compare' | 'leaderboard' | 'recommend' | 'keys'
+type Tab = 'compare' | 'leaderboard' | 'recommend' | 'drift' | 'keys'
 
 /** 多模型竞技场视图页。 */
 export function ModelArenaView(_props: ModelArenaViewProps): ReactElement {
@@ -70,6 +110,9 @@ export function ModelArenaView(_props: ModelArenaViewProps): ReactElement {
         <Button size="sm" variant={tab === 'recommend' ? 'primary' : 'secondary'} onClick={() => setTab('recommend')}>
           模型推荐
         </Button>
+        <Button size="sm" variant={tab === 'drift' ? 'primary' : 'secondary'} onClick={() => setTab('drift')}>
+          漂移监控
+        </Button>
         <Button size="sm" variant={tab === 'keys' ? 'primary' : 'secondary'} onClick={() => setTab('keys')}>
           模型与 Key 管理
         </Button>
@@ -77,6 +120,7 @@ export function ModelArenaView(_props: ModelArenaViewProps): ReactElement {
       {tab === 'compare' && <ComparePanel models={models} />}
       {tab === 'leaderboard' && <LeaderboardPanel models={models} />}
       {tab === 'recommend' && <RecommendPanel />}
+      {tab === 'drift' && <DriftPanel models={models} />}
       {tab === 'keys' && <KeysPanel models={models} onChanged={reloadModels} />}
     </div>
   )
@@ -528,5 +572,223 @@ function KeysPanel(props: { models: readonly ArenaModelInfo[]; onChanged: () => 
           </div>
         ))}
     </section>
+  )
+}
+
+/** 金丝雀漂移监控面板：勾选模型运行确定性探针组，四维度比对基线检测漂移。 */
+function DriftPanel(props: { models: readonly ArenaModelInfo[] }): ReactElement {
+  const { models } = props
+  // 模型目录：优先复用视图级目录（挂载时已就绪则直接用），否则自行拉取兜底。
+  const [ownModels, setOwnModels] = useState<readonly ArenaModelInfo[]>([])
+  const catalog = models.length > 0 ? models : ownModels
+  const { selected, toggle } = useModelSelection(catalog)
+
+  const [overview, setOverview] = useState<readonly CanaryOverviewRow[]>([])
+  const [detail, setDetail] = useState<CanaryModelReport | undefined>()
+  const [runReports, setRunReports] = useState<readonly DriftReport[]>([])
+  const [busy, setBusy] = useState(false)
+
+  /** 模型目录兜底拉取（仅当视图级目录为空时）。 */
+  useEffect(() => {
+    if (models.length > 0) return
+    fetchArenaModels()
+      .then((response) => setOwnModels(response.models))
+      .catch((err: unknown) => Toast.push(err instanceof Error ? err.message : '加载模型目录失败', 'error'))
+  }, [models])
+
+  /** 加载全部受监控模型概览。 */
+  const loadOverview = useCallback(() => {
+    fetchCanaryOverview()
+      .then((response) => setOverview(response.models))
+      .catch((err: unknown) => Toast.push(err instanceof Error ? err.message : '加载漂移概览失败', 'error'))
+  }, [])
+
+  useEffect(() => {
+    loadOverview()
+  }, [loadOverview])
+
+  /** 运行探针并比对基线（探针组逐条串行调用，给长超时）。 */
+  const run = useCallback(async () => {
+    if (selected.size === 0) return
+    setBusy(true)
+    setRunReports([])
+    try {
+      const response = await runCanaryProbes({ models: [...selected] }, { timeoutMs: 120_000 })
+      setRunReports(response.reports)
+      loadOverview()
+    } catch (err) {
+      Toast.push(err instanceof Error ? err.message : '探针运行失败', 'error')
+    } finally {
+      setBusy(false)
+    }
+  }, [selected, loadOverview])
+
+  /** 展开单模型漂移详情（只读报告，不发起任何调用）。 */
+  const openDetail = useCallback(async (model: string) => {
+    try {
+      const response = await fetchCanaryReport(model)
+      setDetail(response)
+    } catch (err) {
+      Toast.push(err instanceof Error ? err.message : '加载漂移详情失败', 'error')
+    }
+  }, [])
+
+  /** 重置基线（确认厂商更新模型后重新锚定）。 */
+  const resetBaseline = useCallback(
+    async (model: string) => {
+      if (!window.confirm(`确认重置 ${model} 的漂移基线？历史比对将清空，下次运行探针重新锚定。`)) return
+      try {
+        const response = await resetCanaryBaseline({ model })
+        Toast.push(response.hint, 'success')
+        setDetail((prev) => (prev?.model === model ? undefined : prev))
+        loadOverview()
+      } catch (err) {
+        Toast.push(err instanceof Error ? err.message : '重置基线失败', 'error')
+      }
+    },
+    [loadOverview],
+  )
+
+  return (
+    <section className={styles.section}>
+      <p className={styles.hint}>
+        探针为确定性调用，首次运行建立基线，之后累积历史比对；确认厂商更新模型后可重置基线重新锚定。
+      </p>
+      <h3>模型选择（最多 5 个）</h3>
+      <div className={styles.modelGrid}>
+        {catalog.map((model) => (
+          <label key={model.id} className={styles.modelOption}>
+            <Checkbox
+              checked={selected.has(model.id)}
+              label={`${model.label}${model.provider === 'external' ? (model.keyConfigured ? '（Key 已配置）' : '（未配置 Key）') : ''}`}
+              onChange={() => toggle(model.id)}
+            />
+          </label>
+        ))}
+      </div>
+      <div className={styles.row}>
+        <Button variant="primary" size="sm" disabled={busy || selected.size === 0} onClick={() => void run()}>
+          {busy ? '探针运行中…' : '运行探针并比对基线'}
+        </Button>
+      </div>
+      {busy && <Spinner label="正在运行确定性探针组并比对基线…" />}
+
+      {runReports.length > 0 && (
+        <>
+          <h3>本轮探针报告</h3>
+          {runReports.map((report) => (
+            <DriftReportDetail key={report.model} report={report} />
+          ))}
+        </>
+      )}
+
+      <h3>受监控模型概览（{overview.length}）</h3>
+      {overview.length === 0 ? (
+        <p className={styles.hint}>尚无监控数据：先勾选模型运行一次探针建立基线。</p>
+      ) : (
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>基线锚点</th>
+              <th>历史运行</th>
+              <th>判定</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {overview.map((row) => (
+              <tr
+                key={row.model}
+                className={styles.driftRow}
+                title="点击查看漂移详情"
+                onClick={() => void openDetail(row.model)}
+              >
+                <td>{row.model}</td>
+                <td>{formatTimestamp(row.baselineTs)}</td>
+                <td>{row.historyRuns} 次</td>
+                <td>
+                  <DriftLevelPill level={row.verdict} />
+                </td>
+                {/* 操作列阻止冒泡，避免按钮点击重复触发行点击。 */}
+                <td onClick={(event) => event.stopPropagation()}>
+                  <div className={styles.row}>
+                    <Button size="sm" variant="secondary" onClick={() => void openDetail(row.model)}>
+                      查看详情
+                    </Button>
+                    <Button size="sm" variant="danger" disabled={busy} onClick={() => void resetBaseline(row.model)}>
+                      重置基线
+                    </Button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {detail && (
+        <>
+          <div className={styles.driftDetailHeader}>
+            <h3>{detail.model} · 漂移详情</h3>
+            <Button size="sm" variant="ghost" onClick={() => setDetail(undefined)}>
+              收起
+            </Button>
+          </div>
+          <p className={styles.driftMeta}>
+            基线锚点 {formatTimestamp(detail.baselineTs)} · 历史运行 {detail.historyRuns} 次 · 探针组：
+            {detail.probes.join('、')}
+          </p>
+          <DriftReportDetail report={detail.report} />
+        </>
+      )}
+    </section>
+  )
+}
+
+/** 漂移级别 Pill（稳定=绿 / 预警=黄 / 漂移=红）。 */
+function DriftLevelPill(props: { level: DriftLevel }): ReactElement {
+  const meta = DRIFT_LEVEL_META[props.level]
+  return <Pill className={meta.cls}>{meta.label}</Pill>
+}
+
+/** 单份漂移报告详情：四维度统计表（统计量/阈值/判定/说明）+ 汇总结论。 */
+function DriftReportDetail(props: { report: DriftReport }): ReactElement {
+  const { report } = props
+  return (
+    <div className={styles.driftDetail}>
+      <div className={styles.driftDetailHeader}>
+        <strong>{report.model}</strong>
+        <DriftLevelPill level={report.verdict} />
+        <span className={styles.driftMeta}>
+          基线锚点 {formatTimestamp(report.baselineTs)} · 已比对 {report.runsCompared} 次
+        </span>
+      </div>
+      <table className={styles.table}>
+        <thead>
+          <tr>
+            <th>维度</th>
+            <th>统计量</th>
+            <th>漂移阈值</th>
+            <th>判定</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          {report.dimensions.map((dimension) => (
+            <tr key={dimension.name}>
+              <td>{DRIFT_DIMENSION_LABELS[dimension.name]}</td>
+              <td>{dimension.statistic}</td>
+              <td>{dimension.threshold}</td>
+              <td>
+                <DriftLevelPill level={dimension.level} />
+              </td>
+              <td>{dimension.detail}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className={styles.driftSummary}>{report.summary}</p>
+    </div>
   )
 }

@@ -25,6 +25,7 @@ import {
   type TranscriptTurn,
 } from '../../core/transcript.js'
 import { buildZip, sanitizeFileName, type ZipEntry } from '../../core/zip.js'
+import { buildInteractiveHtml } from './interactive.js'
 import type {
   SessionHeader,
   SessionLogSnapshot,
@@ -33,7 +34,7 @@ import type {
 } from '../../types/harness.js'
 
 /** 导出格式。 */
-export type ExportFormat = 'markdown' | 'pdf' | 'json' | 'png'
+export type ExportFormat = 'markdown' | 'pdf' | 'json' | 'png' | 'html'
 
 /** 单次导出选项。 */
 export interface ExportOptions {
@@ -187,19 +188,10 @@ export async function buildBatchExport(
 }
 
 /**
- * 将错误收敛为用户安全的 HttpError：
- * HttpError 原样透传；其余错误以通用文案包装，避免泄漏内部细节。
+ * 错误收敛与用户可读文案的统一实现已上移 core/http.ts
+ * （全插件唯一权威实现）；此处 re-export 保持既有导入路径兼容。
  */
-export function toSafeHttpError(error: unknown, fallbackMessage: string): HttpError {
-  if (error instanceof HttpError) return error
-  return new HttpError(fallbackMessage, 500)
-}
-
-/** 提取命令面板可用的用户可读错误文本（不泄漏内部细节）。 */
-export function userFacingMessage(error: unknown, fallbackMessage: string): string {
-  if (error instanceof HttpError) return error.message
-  return fallbackMessage
-}
+export { toSafeHttpError, userFacingMessage } from '../../core/http.js'
 
 /** 读取会话并渲染为导出中间产物。 */
 async function buildExport(
@@ -239,6 +231,15 @@ async function buildExport(
       fileName: `${baseName}.json`,
       mimeType: 'application/json; charset=utf-8',
       bytes: encoder.encode(transcriptToJson(session, turns, { timestamps })),
+    }
+  }
+  // 交互式自包含 HTML：单文件交互档案（搜索/筛选/折叠，零外部依赖）。
+  if (options.format === 'html') {
+    return {
+      kind: 'file',
+      fileName: `${baseName}.html`,
+      mimeType: 'text/html; charset=utf-8',
+      bytes: encoder.encode(buildInteractiveHtml(session, turns, { timestamps })),
     }
   }
 

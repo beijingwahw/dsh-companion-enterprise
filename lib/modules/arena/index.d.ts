@@ -10,7 +10,13 @@
  * - POST   /arena/compare       G1 同 Prompt 多模型并行对比（最多 5 个模型）；
  * - POST   /arena/leaderboard   G2 批量评测排行榜（JSON/JSONL 测试集，
  *                               准确率/延迟分位/Token/成本/合规率，报告 MD/HTML）；
- * - GET    /arena/recommend     G3 模型推荐引擎（任务类型+预算+延迟+峰谷感知）。
+ * - GET    /arena/recommend     G3 模型推荐引擎（任务类型+预算+延迟+峰谷感知）；
+ * - POST   /arena/canary/run    G4 金丝雀探针漂移监控（运行探针并比对基线）；
+ * - GET    /arena/canary/report G4 查看已存探针记录的漂移报告（不发起调用）；
+ * - POST   /arena/canary/reset  G4 重置基线（确认厂商更新模型后重新锚定）。
+ * - POST   /arena/glicko/match  G6 Glicko-2 时变置信评级：提交偏好对战；
+ * - GET    /arena/glicko        G6 评级表（保守分排名 + 95% CI + 闲置 RD 增长）；
+ * - POST   /arena/glicko/reset  G6 清空全部对战与评级。
  *
  * 外部厂商调用走 OpenAI 兼容 chat/completions 协议；baseUrl 可随 Key 一并
  * 配置（指向任意兼容网关）。安全红线：任何响应不回传 Key 明文。

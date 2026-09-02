@@ -23,6 +23,8 @@ export interface CostSettings {
   peakScheduling: boolean
   /** 模型路由开关：按任务难易选择简单/复杂模型。 */
   modelRouting: boolean
+  /** 自适应路由开关：UCB1 赌博机从真实调用结果中学习每类任务的最优模型。 */
+  adaptiveRouting: boolean
   /** 日预算（人民币元，北京时间日）；0 表示不限。 */
   dailyBudgetCny: number
   /** 月度预算（人民币元）；0 表示不限。 */
@@ -40,6 +42,7 @@ export const CostSettings: Schema<CostSettings> = Schema.object({
   devMode: Schema.boolean().default(false).description('开发者模式总开关'),
   peakScheduling: Schema.boolean().default(false).description('峰谷调度'),
   modelRouting: Schema.boolean().default(false).description('模型路由'),
+  adaptiveRouting: Schema.boolean().default(false).description('自适应路由（UCB1 学习）'),
   dailyBudgetCny: Schema.number().min(0).default(0).description('日预算（元，0=不限）'),
   monthlyBudgetCny: Schema.number().min(0).default(0).description('月度预算（元，0=不限）'),
   simpleModel: Schema.string().default('deepseek-chat').description('简单任务模型'),

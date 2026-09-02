@@ -10,7 +10,7 @@
  * 计价引擎。推荐引擎（G3）结合任务类型 + 预算 + 延迟要求 + 峰谷定价
  * 给出排序建议。
  */
-import { CATALOG_TABLE, VENDORS, vendorOf } from '../../core/price/catalog.js'
+import { CATALOG_TABLE, vendorInfoOf, vendorOf } from '../../core/price/catalog.js'
 import { isPeakTime } from '../../core/time.js'
 
 /** 任务类型。 */
@@ -285,7 +285,7 @@ export function deriveModelsFromIds(
     if (!vendor || vendor === 'deepseek') continue
     const baseUrl = VENDOR_BASE_URLS[vendor]
     if (!baseUrl) continue
-    const vendorLabel = VENDORS[vendor]?.label ?? vendor
+    const vendorLabel = vendorInfoOf(vendor)?.label ?? vendor
     derived.push({
       id: modelId,
       label: `${vendorLabel} ${modelId}`,

@@ -129,8 +129,8 @@ export interface SectionReport {
 // I2 执行经验库
 // ---------------------------------------------------------------------------
 
-/** 执行卡片来源。 */
-export type ExperienceSource = 'pipeline' | 'queue' | 'cron' | 'manual'
+/** 执行卡片来源（'session' = 经验自动蒸馏晋升）。 */
+export type ExperienceSource = 'pipeline' | 'queue' | 'cron' | 'manual' | 'session'
 
 /** 问题与解决方案笔记（用户手动补充）。 */
 export interface ExperienceNote {

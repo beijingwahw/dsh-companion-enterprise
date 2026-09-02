@@ -6,17 +6,46 @@
  *     POST /team/config/diff、POST /team/config/import（local/remote/manual 三种合并策略）、
  *     GET/DELETE /team/snapshots（最近导入快照归档）；
  * I2 执行经验库：GET/POST/DELETE /team/experience、POST /team/experience/notes、
- *     POST /team/experience/recommend；
+ *     POST /team/experience/recommend（有效性加权排序）、POST /team/experience/
+ *     feedback（注入反馈回填）、GET /team/effectiveness（有效性报告）、
+ *     POST /team/effectiveness/sweep（组织性遗忘）；
  * I3 Prompt 协作评审：GET/POST/DELETE /team/reviews、GET /team/reviews/get、
- *     POST /team/reviews/comment、POST /team/reviews/decide、POST /team/reviews/merge。
+ *     POST /team/reviews/comment、POST /team/reviews/decide、POST /team/reviews/merge；
+ * I4 专家路由：GET/POST/DELETE /team/experts、GET /team/experts/profiles（知识足迹
+ *     画像）、POST /team/experts/route（余弦匹配推荐 + 知识盲区）；
+ * I5 Bus Factor：GET /team/busfactor（领域覆盖单点风险 + PageRank 协作枢纽
+ *     + 孤立专家检测）。
  *
  * costSettings 分区导入时一律跳过（需经成本模块界面配置）；
  * pricingOverrides 导入后落 'cost-extra' 表并同步动态计价引擎。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { ChatMessage } from '../../core/deepseek.js'
+import { HttpError, clampIntParam, sendJson } from '../../core/http.js'
+import { SessionId } from '../../core/ids.js'
 import type { Domain } from '../../core/storage-adapter.js'
-import { HttpError, sendJson } from '../../core/http.js'
+import { transcriptFromLog } from '../../core/transcript.js'
 import type { ModelPrice, PriceTable } from '../../core/price/types.js'
+import type { SessionLogSnapshot } from '../../types/harness.js'
+import {
+  buildDistillPrompt,
+  confidenceOf,
+  DEFAULT_MIN_SIGNAL,
+  DistilledCardStore,
+  type DistilledCard,
+  MINING_TURN_CAP,
+  mineSignals,
+  parseDistilledCard,
+} from './distill.js'
+import { buildProfileIndex, ExpertStore, profileViews, routeQuestion } from './expert.js'
+import { analyzeBusFactor } from './busfactor.js'
+import {
+  assessCard,
+  type EffectivenessStatus,
+  EffectivenessStore,
+  type FeedbackOutcome,
+  effectivenessWeight,
+} from './effectiveness.js'
 import type {
   ConfigDiffEntry,
   ConfigSection,
@@ -51,8 +80,8 @@ import {
 /** 插件名。 */
 export const name = 'companion-team'
 
-/** 依赖服务：仅 companion 根服务。 */
-export const inject = ['companion']
+/** 依赖服务：companion 根服务 + 会话查询（经验蒸馏读轨迹）。 */
+export const inject = ['companion', 'sessionQuery']
 
 /** 'cost-extra' 表中 pricing 覆盖的键（与成本模块同源）。 */
 const COST_EXTRA_PRICING_KEY = 'pricing'
@@ -66,9 +95,20 @@ export function apply(ctx: Context): void {
     const prefs = new TeamPrefsStore(domain)
     const snapshots = new SnapshotArchiveStore(domain)
     const cards = new ExperienceCardStore(domain)
+    const distilled = new DistilledCardStore(domain)
+    const effectiveness = new EffectivenessStore(domain)
     const reviews = new ReviewRequestStore(domain)
     const comments = new ReviewCommentStore(domain)
     const decisions = new ReviewDecisionStore(domain)
+    const experts = new ExpertStore(domain)
+
+    /** 构建全体专家的知识足迹索引（注册领域 + 评审产出加权语料）。 */
+    const buildExpertIndex = () => {
+      const allReviews = reviews.list()
+      const allComments = allReviews.flatMap((review) => comments.forReview(review.id))
+      const allDecisions = allReviews.flatMap((review) => decisions.forReview(review.id))
+      return buildProfileIndex(experts.list(), allReviews, allComments, allDecisions)
+    }
 
     /** 当前成员署名（未配置时的兜底标识）。 */
     const memberName = (): string => prefs.get().memberName || '匿名成员'
@@ -78,6 +118,88 @@ export function apply(ctx: Context): void {
       const review = reviews.get(id)
       if (!review) throw new HttpError(`评审不存在：${id}`, 404)
       return review
+    }
+
+    // ------------------------------------------------------------------
+    // 经验自动蒸馏（创新扩展）：信号挖矿 → 元提示蒸馏 → 语义去重合并
+    // ------------------------------------------------------------------
+
+    /** 单会话蒸馏产物（HTTP 响应形状）。 */
+    interface DistillOutcome {
+      status: 'created' | 'merged' | 'no-signal'
+      card?: DistilledCard
+      confidence?: number
+      signalScore?: number
+      signalCount: number
+    }
+
+    /** 调用模型（成本策略层优先，缺省直连核心服务）。 */
+    async function callModel(messages: readonly ChatMessage[]): Promise<string> {
+      const costGateway = ctx.get('companionCost')
+      if (costGateway) {
+        const result = await costGateway.call({
+          messages,
+          taskHint: '经验蒸馏',
+          source: 'team',
+          priority: 'high',
+        })
+        return result.content
+      }
+      const result = await ctx.companion.callDeepSeek({
+        messages,
+        model: 'deepseek-chat',
+        source: 'team',
+      })
+      return result.content
+    }
+
+    /**
+     * 蒸馏单个会话：读轨迹 → 信号挖矿（本地启发式）→ 最高分信号的
+     * 错误-修复上下文交模型蒸馏 → JSON 解析收窄 → 语义去重落库。
+     * 无信号（未检测到错误→修复结构）不消耗模型调用，直接返回。
+     */
+    async function distillSession(sessionId: string): Promise<DistillOutcome> {
+      let snapshot: SessionLogSnapshot
+      try {
+        snapshot = await ctx.sessionQuery.readSession(SessionId(sessionId))
+      } catch (error) {
+        throw new HttpError(
+          `读取会话失败：${error instanceof Error ? error.message : String(error)}`,
+          404,
+        )
+      }
+      const turns = transcriptFromLog(snapshot).slice(-MINING_TURN_CAP)
+      const signals = mineSignals(turns)
+      if (signals.length === 0) return { status: 'no-signal', signalCount: 0 }
+      const top = signals[0]
+      const messages: readonly ChatMessage[] = [{ role: 'user', content: buildDistillPrompt(top) }]
+      let content: string
+      try {
+        content = await callModel(messages)
+      } catch (error) {
+        throw new HttpError(
+          `模型调用失败：${error instanceof Error ? error.message : String(error)}`,
+          502,
+        )
+      }
+      let outcome: DistillOutcome
+      try {
+        const parsed = parseDistilledCard(content)
+        const { card, merged } = await distilled.dedupPut(parsed, top, sessionId)
+        outcome = {
+          status: merged ? 'merged' : 'created',
+          card,
+          confidence: confidenceOf(card),
+          signalScore: top.score,
+          signalCount: signals.length,
+        }
+      } catch (error) {
+        throw new HttpError(
+          `蒸馏结果解析失败：${error instanceof Error ? error.message : String(error)}`,
+          502,
+        )
+      }
+      return outcome
     }
 
     try {
@@ -219,11 +341,195 @@ export function apply(ctx: Context): void {
             sendJson(res, 200, { ok: true })
           }),
 
+          /**
+           * 相似推荐：文本匹配分 × 有效性系数重排（创新扩展）——
+           * 多取 3 候选避免截断，注入反馈画像（proven 浮现 / harmful 沉底）
+           * 参与排序后再截取 limit，并把有效性画像随结果返回。
+           */
           ctx.companion.http.add('POST', '/team/experience/recommend', (_req, res, hctx) => {
             const body = readObject(hctx.body)
             const rawLimit = optionalNumber(body.limit)
             const limit = rawLimit === undefined ? 5 : Math.max(1, Math.floor(rawLimit))
-            sendJson(res, 200, { results: cards.recommend(requireString(body.text, 'text'), limit) })
+            const candidates = cards.recommend(requireString(body.text, 'text'), limit * 3)
+            const ranked = candidates
+              .map(({ card, score }) => {
+                const assessment = assessCard(card, effectiveness.eventsOf(card.id))
+                return {
+                  card,
+                  score: Math.round(score * effectivenessWeight(assessment.status) * 100) / 100,
+                  textScore: score,
+                  effectiveness: assessment,
+                }
+              })
+              .sort((a, b) => b.score - a.score)
+              .slice(0, limit)
+            sendJson(res, 200, { results: ranked })
+          }),
+
+          // ---- I2 创新扩展：经验有效性追踪（注入反馈 + 半衰期淘汰） ----
+
+          // 回填一次注入反馈：执行结束后告诉经验库"这条经验帮到/害到我了"。
+          ctx.companion.http.add('POST', '/team/experience/feedback', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const cardId = requireString(body.cardId, 'cardId')
+            const card = cards.get(cardId)
+            if (!card) throw new HttpError(`执行卡片不存在：${cardId}`, 404)
+            const outcomeRaw = body.outcome
+            if (outcomeRaw !== 'helped' && outcomeRaw !== 'neutral' && outcomeRaw !== 'hurt') {
+              throw new HttpError("outcome 必须是 'helped'、'neutral' 或 'hurt'", 400)
+            }
+            const note = requireOptionalString(body.note, 'note')
+            await effectiveness.record(cardId, outcomeRaw as FeedbackOutcome, note)
+            sendJson(res, 200, {
+              effectiveness: assessCard(card, effectiveness.eventsOf(cardId)),
+            })
+          }),
+
+          // 全库有效性报告：状态画像 + 组织性遗忘候选。
+          ctx.companion.http.add('GET', '/team/effectiveness', (_req, res) => {
+            sendJson(res, 200, { report: effectiveness.buildReport(cards.list()) })
+          }),
+
+          /**
+           * 组织性遗忘：按有效性画像清理经验库。
+           * mode=harmful 清理有害卡；stale 清理久未使用卡；both 两者皆清
+           * （stale 额外要求评分 < 0.5，避免误杀高价值未复用经验）。
+           */
+          ctx.companion.http.add('POST', '/team/effectiveness/sweep', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const modeRaw = body.mode === undefined ? 'both' : body.mode
+            if (modeRaw !== 'harmful' && modeRaw !== 'stale' && modeRaw !== 'both') {
+              throw new HttpError("mode 必须是 'harmful'、'stale' 或 'both'", 400)
+            }
+            const report = effectiveness.buildReport(cards.list())
+            const shouldRetire = (status: EffectivenessStatus, score: number): boolean => {
+              if (status === 'harmful') return modeRaw !== 'stale'
+              return modeRaw !== 'harmful' && status === 'stale' && score < 0.5
+            }
+            const deleted: string[] = []
+            for (const item of report.cards) {
+              if (shouldRetire(item.status, item.score)) {
+                await cards.delete(item.cardId)
+                deleted.push(item.cardId)
+              }
+            }
+            sendJson(res, 200, { deleted, remaining: cards.list().length })
+          }),
+
+          // ---- I2 创新扩展：经验自动蒸馏 ----
+
+          // 蒸馏单个会话：信号挖矿 → 元提示蒸馏 → 语义去重落库。
+          ctx.companion.http.add('POST', '/team/experience/distill', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const sessionId = requireString(body.sessionId, 'sessionId')
+            sendJson(res, 200, await distillSession(sessionId))
+          }),
+
+          /**
+           * 批量挖矿：扫描最近会话，本地信号打分后仅对高信号会话发起蒸馏
+           * （模型调用只花在刀刃上）。已蒸馏过的会话自动跳过。
+           * 参数：limit 扫描会话数（缺省 30）、maxDistill 单批蒸馏上限
+           * （缺省 5，按信号得分降序取）、minSignal 蒸馏门槛（缺省 0.45）。
+           */
+          ctx.companion.http.add('POST', '/team/experience/distill/scan', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const limit = clampIntParam(body.limit, 1, 100, 30)
+            const maxDistill = clampIntParam(body.maxDistill, 1, 10, 5)
+            const minSignalRaw = optionalNumber(body.minSignal)
+            const minSignal =
+              minSignalRaw === undefined ? DEFAULT_MIN_SIGNAL : Math.min(Math.max(minSignalRaw, 0), 1)
+            // 候选：未蒸馏过的最近会话（按更新时间降序）。
+            const sessions = [...(await ctx.sessionQuery.listSessions())]
+              .sort((a, b) => (b.updatedAt ?? b.createdAt) - (a.updatedAt ?? a.createdAt))
+              .slice(0, limit)
+            const candidates: Array<{ sessionId: string; title: string; score: number }> = []
+            for (const session of sessions) {
+              const id = String(session.id)
+              if (distilled.hasSession(id)) continue
+              try {
+                const snapshot = await ctx.sessionQuery.readSession(SessionId(id))
+                const signals = mineSignals(transcriptFromLog(snapshot).slice(-MINING_TURN_CAP))
+                if (signals.length === 0) continue
+                if (signals[0].score >= minSignal) {
+                  candidates.push({
+                    sessionId: id,
+                    title: session.title ?? '未命名对话',
+                    score: signals[0].score,
+                  })
+                }
+              } catch {
+                // 单会话读取失败：跳过，不影响其余扫描。
+              }
+            }
+            // 高信号候选按得分降序蒸馏（顺序执行防限流）。
+            candidates.sort((a, b) => b.score - a.score)
+            const distilledResults: Array<{ sessionId: string; outcome: DistillOutcome }> = []
+            const errors: Array<{ sessionId: string; error: string }> = []
+            for (const candidate of candidates.slice(0, maxDistill)) {
+              try {
+                distilledResults.push({
+                  sessionId: candidate.sessionId,
+                  outcome: await distillSession(candidate.sessionId),
+                })
+              } catch (error) {
+                errors.push({
+                  sessionId: candidate.sessionId,
+                  error: error instanceof Error ? error.message : String(error),
+                })
+              }
+            }
+            sendJson(res, 200, {
+              scanned: sessions.length,
+              candidates,
+              distilled: distilledResults,
+              errors,
+            })
+          }),
+
+          // 蒸馏卡列表（按置信度降序；复发次数 + 信号强度加权）。
+          ctx.companion.http.add('GET', '/team/experience/distilled', (_req, res) => {
+            sendJson(res, 200, {
+              cards: distilled.list().map((card) => ({ ...card, confidence: confidenceOf(card) })),
+            })
+          }),
+
+          /**
+           * 晋升：把蒸馏卡确认为正式执行经验卡（人工把关闭环——
+           * 蒸馏管线负责发现，晋升按钮负责把关，推荐/检索基础设施复用）。
+           */
+          ctx.companion.http.add('POST', '/team/experience/distilled/promote', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const id = requireString(body.id, 'id')
+            const card = distilled.get(id)
+            if (!card) throw new HttpError(`蒸馏卡不存在：${id}`, 404)
+            if (card.promoted) throw new HttpError('该蒸馏卡已晋升', 400)
+            const now = Date.now()
+            const formal: ExperienceCard = {
+              id: teamId('exp'),
+              createdAt: now,
+              updatedAt: now,
+              source: 'session',
+              sourceId: card.sessionId,
+              runId: card.id,
+              title: card.title,
+              model: '',
+              promptSummary: card.lesson,
+              durationMs: 0,
+              tokens: 0,
+              ok: true,
+              error: card.problem,
+              tags: [...card.tags],
+              notes: [{ problem: card.problem, solution: card.solution, ts: now }],
+            }
+            await cards.put(formal)
+            const promoted = (await distilled.markPromoted(id)) ?? card
+            sendJson(res, 200, { card: formal, distilledCard: promoted })
+          }),
+
+          ctx.companion.http.add('DELETE', '/team/experience/distilled', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            await distilled.delete(requireString(body.id, 'id'))
+            sendJson(res, 200, { ok: true })
           }),
 
           // ---- I3 Prompt 协作评审 ----
@@ -326,6 +632,55 @@ export function apply(ctx: Context): void {
               if (decision.reviewId === id) await decisionTable.delete(key)
             }
             sendJson(res, 200, { ok: true })
+          }),
+
+          // --------------------------------------------------------------
+          // 专家路由：知识足迹画像 + 余弦匹配（创新扩展）
+          // --------------------------------------------------------------
+          // 注册/更新专家（同名更新；署名与评审 author 一致可吃到评审产出足迹）。
+          ctx.companion.http.add('POST', '/team/experts', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const name = requireString(body.name, 'name')
+            const domains = parseStringArray(body.domains, 'domains')
+            if (domains.length === 0) throw new HttpError('domains 至少需要 1 个领域关键词', 400)
+            const bio = typeof body.bio === 'string' ? body.bio.trim() : ''
+            const expert = await experts.save({ name, domains, bio })
+            sendJson(res, 200, { expert })
+          }),
+
+          // 专家目录。
+          ctx.companion.http.add('GET', '/team/experts', (_req, res) => {
+            sendJson(res, 200, { experts: experts.list() })
+          }),
+
+          // 删除专家。
+          ctx.companion.http.add('DELETE', '/team/experts', async (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const id = requireString(body.id, 'id')
+            await experts.delete(id)
+            sendJson(res, 200, { ok: true })
+          }),
+
+          // 知识足迹画像面板：TF-IDF 顶部术语 + 足迹来源拆解。
+          ctx.companion.http.add('GET', '/team/experts/profiles', (_req, res) => {
+            const index = buildExpertIndex()
+            sendJson(res, 200, { profiles: profileViews(index) })
+          }),
+
+          // 专家路由：问题 → 余弦匹配 → 推荐专家 + 知识盲区检测。
+          ctx.companion.http.add('POST', '/team/experts/route', (_req, res, hctx) => {
+            const body = readObject(hctx.body)
+            const question = requireString(body.question, 'question')
+            const index = buildExpertIndex()
+            sendJson(res, 200, routeQuestion(index, question))
+          }),
+
+          // Bus Factor + 协作中心性（创新扩展）：领域覆盖单点风险 +
+          // PageRank 协作枢纽 + 孤立专家检测。
+          ctx.companion.http.add('GET', '/team/busfactor', (_req, res) => {
+            const allReviews = reviews.list()
+            const allComments = allReviews.flatMap((review) => comments.forReview(review.id))
+            sendJson(res, 200, analyzeBusFactor(experts.list(), allReviews, allComments))
           }),
         ]
         return () => {
@@ -767,12 +1122,17 @@ function parseStrategy(value: unknown, field: string): MergeStrategy {
   throw new HttpError(`${field} 必须是 'local'、'remote' 或 'manual'`, 400)
 }
 
-/** 解析执行卡片来源（缺省 manual），非法即 400。 */
+/** 解析执行卡片来源（缺省 manual；'session' = 经验自动蒸馏晋升），非法即 400。 */
 function parseExperienceSource(value: unknown): ExperienceSource {
   if (value === undefined) return 'manual'
-  if (value === 'pipeline' || value === 'queue' || value === 'cron' || value === 'manual') return value
-  throw new HttpError("source 必须是 'pipeline'、'queue'、'cron' 或 'manual'", 400)
+  if (
+    value === 'pipeline' || value === 'queue' || value === 'cron' ||
+    value === 'manual' || value === 'session'
+  ) return value
+  throw new HttpError("source 必须是 'pipeline'、'queue'、'cron'、'manual' 或 'session'", 400)
 }
+
+// clampInt 已上移 core/http.ts（clampIntParam，全插件唯一权威实现）。
 
 /** 解析评论批注锚点（缺省为提议侧整体评论）。 */
 function parseAnchor(value: unknown): ReviewAnchor {

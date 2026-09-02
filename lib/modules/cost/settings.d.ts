@@ -21,6 +21,8 @@ export interface CostSettings {
     peakScheduling: boolean;
     /** 模型路由开关：按任务难易选择简单/复杂模型。 */
     modelRouting: boolean;
+    /** 自适应路由开关：UCB1 赌博机从真实调用结果中学习每类任务的最优模型。 */
+    adaptiveRouting: boolean;
     /** 日预算（人民币元，北京时间日）；0 表示不限。 */
     dailyBudgetCny: number;
     /** 月度预算（人民币元）；0 表示不限。 */

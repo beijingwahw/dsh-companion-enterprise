@@ -152,14 +152,14 @@ export function ImportSummaryDock(props: ImportSummaryDockProps): ReactElement {
         </div>
       ))}
 
-      {receipts.length > 0 ? (
+      {receipts.length > 0 && receipts[0] ? (
         <div
           className={styles.receipt}
-          title={`交接摘要已于 ${new Date(receipts[0]!.injectedAt).toLocaleString()} 注入会话 ${receipts[0]!.sessionId}`}
+          title={`交接摘要已于 ${new Date(receipts[0].injectedAt).toLocaleString()} 注入会话 ${receipts[0].sessionId}`}
         >
           <Pill className={styles.receiptBadge}>已注入</Pill>
           <span className={styles.receiptSummary}>
-            会话 {truncate(receipts[0]!.sessionId, 24)}
+            会话 {truncate(receipts[0].sessionId, 24)}
           </span>
         </div>
       ) : null}

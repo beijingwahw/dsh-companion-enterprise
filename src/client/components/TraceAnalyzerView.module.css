@@ -235,3 +235,174 @@
   font-size: 12px;
   color: var(--dsw-alias-fg-secondary, #57606a);
 }
+
+/* SPC 控制图（E5 创新扩展） */
+
+.spcField {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcInput {
+  width: 88px;
+}
+
+.spcHint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.spcBannerStable {
+  background: var(--dsw-alias-bg-success-subtle, #dafbe1);
+}
+
+.spcBannerWarning {
+  background: var(--dsw-alias-bg-warning-subtle, #fff8c5);
+}
+
+.spcBannerOoc {
+  background: var(--dsw-alias-bg-danger-subtle, #ffebe9);
+}
+
+.spcOkBadge {
+  color: var(--dsw-alias-fg-success, #1a7f37);
+  font-weight: 600;
+}
+
+.spcWarnBadge {
+  color: var(--dsw-alias-fg-warning, #9a6700);
+  font-weight: 600;
+}
+
+.spcBadBadge {
+  color: var(--dsw-alias-fg-danger, #cf222e);
+  font-weight: 600;
+}
+
+.spcDetail {
+  flex: 1;
+  min-width: 220px;
+}
+
+.spcRate {
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.spcStats {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcChartWrap {
+  overflow-x: auto;
+}
+
+.spcChart {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+}
+
+.spcGrid {
+  stroke: var(--dsw-alias-border-primary, #d0d7de);
+  stroke-width: 1;
+}
+
+.spcAxisText {
+  font-size: 10px;
+  fill: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcLineValue {
+  fill: none;
+  stroke: var(--dsw-alias-fg-secondary, #57606a);
+  stroke-width: 1;
+}
+
+.spcLineEwma {
+  fill: none;
+  stroke: var(--dsw-alias-accent-primary, #0969da);
+  stroke-width: 2.5;
+}
+
+.spcLineLimit {
+  fill: none;
+  stroke: var(--dsw-alias-fg-danger, #cf222e);
+  stroke-width: 1.2;
+  stroke-dasharray: 5 4;
+}
+
+.spcLineCenter {
+  stroke: var(--dsw-alias-accent-warning, #9a6700);
+  stroke-width: 1.2;
+  stroke-dasharray: 2 4;
+}
+
+.spcDotBad {
+  fill: var(--dsw-alias-fg-danger, #cf222e);
+}
+
+.spcDotWarn {
+  fill: var(--dsw-alias-accent-warning, #9a6700);
+}
+
+/* 悬停命中区：透明填充仍可接收鼠标事件 */
+.spcHover {
+  fill: transparent;
+  pointer-events: all;
+}
+
+.spcLegend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcLegendDot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  border-radius: 2px;
+}
+
+.spcLegendValue {
+  background: var(--dsw-alias-fg-secondary, #57606a);
+}
+
+.spcLegendEwma {
+  background: var(--dsw-alias-accent-primary, #0969da);
+}
+
+.spcLegendLimit {
+  background: var(--dsw-alias-fg-danger, #cf222e);
+}
+
+.spcLegendCenter {
+  background: var(--dsw-alias-accent-warning, #9a6700);
+}
+
+.spcLegendViolation {
+  background: var(--dsw-alias-fg-danger, #cf222e);
+  border-radius: 50%;
+}

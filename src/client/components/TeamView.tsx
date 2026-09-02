@@ -4,6 +4,8 @@
  *   导入配置快照（文件选择 → diff 预览 → 按策略导入 → 分区汇报）、快照归档管理；
  * - I2 执行经验库：关键词/标签/模型检索、手动创建卡片、
  *   卡片详情（笔记列表与笔记补充）、卡片删除；
+ * - I 创新扩展 经验蒸馏：批量扫描蒸馏（信号挖矿参数化）、蒸馏卡列表
+ *   （置信度 / 复发度 / 证据链回溯）、晋升为正式经验卡与单会话蒸馏；
  * - I3 Prompt 协作评审：评审列表与创建、评审详情（基线/提议对比、
  *   评论批注、通过/拒绝、合并主版本）与删除。
  */
@@ -16,12 +18,15 @@ import {
   createExperienceCard,
   createReview,
   decideReview,
+  deleteDistilledCard,
   deleteExperienceCard,
   deleteReview,
   deleteTeamSnapshot,
   diffTeamConfig,
+  distillSessionExperience,
   downloadBlob,
   exportTeamConfig,
+  fetchDistilledCards,
   fetchExperienceCards,
   fetchReviewDetail,
   fetchReviews,
@@ -29,10 +34,15 @@ import {
   fetchTeamSnapshots,
   importTeamConfig,
   mergeReview,
+  promoteDistilledCard,
   saveTeamPrefs,
+  scanDistillExperience,
 } from '../api.js'
 import type {
   ConfigDiffEntry,
+  DistillOutcome,
+  DistillScanResponse,
+  DistilledCardWithConfidence,
   ExperienceCard,
   MergeStrategy,
   ReviewComment,
@@ -50,7 +60,7 @@ export interface TeamViewProps {
 }
 
 /** 子面板页签。 */
-type Tab = 'sync' | 'experience' | 'review'
+type Tab = 'sync' | 'experience' | 'distill' | 'review'
 
 /** 协作与知识管理视图页。 */
 export function TeamView(_props: TeamViewProps): ReactElement {
@@ -65,12 +75,16 @@ export function TeamView(_props: TeamViewProps): ReactElement {
         <Button size="sm" variant={tab === 'experience' ? 'primary' : 'secondary'} onClick={() => setTab('experience')}>
           经验库
         </Button>
+        <Button size="sm" variant={tab === 'distill' ? 'primary' : 'secondary'} onClick={() => setTab('distill')}>
+          经验蒸馏
+        </Button>
         <Button size="sm" variant={tab === 'review' ? 'primary' : 'secondary'} onClick={() => setTab('review')}>
           评审
         </Button>
       </div>
       {tab === 'sync' && <SyncPanel />}
       {tab === 'experience' && <ExperiencePanel />}
+      {tab === 'distill' && <DistillPanel />}
       {tab === 'review' && <ReviewPanel />}
     </div>
   )
@@ -757,6 +771,364 @@ function ExperiencePanel(): ReactElement {
           </label>
         </div>
       </Modal>
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// I 创新扩展：经验自动蒸馏
+// ---------------------------------------------------------------------------
+
+/** 扫描参数缺省值：扫描会话数（最近 N 个）。 */
+const DISTILL_DEFAULT_LIMIT = 30
+
+/** 扫描参数缺省值：单批蒸馏上限。 */
+const DISTILL_DEFAULT_MAX = 5
+
+/** 扫描参数缺省值：信号门槛（0-1）。 */
+const DISTILL_DEFAULT_MIN_SIGNAL = 0.45
+
+/** 批量扫描蒸馏超时（毫秒）：蒸馏含元提示调用，耗时远超普通接口。 */
+const DISTILL_SCAN_TIMEOUT_MS = 300_000
+
+/** 蒸馏结果状态 → 中文名与 Pill 配色（created=新建/绿、merged=合并/蓝、no-signal=无信号/灰）。 */
+const DISTILL_STATUS: Record<DistillOutcome['status'], { label: string; cls: string }> = {
+  created: { label: '新建', cls: styles.pillSuccess },
+  merged: { label: '合并', cls: styles.pillBrand },
+  'no-signal': { label: '无信号', cls: styles.pillInfo },
+}
+
+/** 0-1 比例 → 整数百分比文案（如 0.873 → “87%”）。 */
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`
+}
+
+/** 长会话 id → 短 id 展示（前 8 位 + 省略号）。 */
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id
+}
+
+/** 经验蒸馏面板：批量扫描蒸馏 + 蒸馏卡列表（置信度/复发/证据链）+ 单会话蒸馏。 */
+function DistillPanel(): ReactElement {
+  // 扫描参数（Input 值均为字符串，提交时再解析校验）
+  const [scanLimit, setScanLimit] = useState(String(DISTILL_DEFAULT_LIMIT))
+  const [maxDistill, setMaxDistill] = useState(String(DISTILL_DEFAULT_MAX))
+  const [minSignal, setMinSignal] = useState(String(DISTILL_DEFAULT_MIN_SIGNAL))
+  const [scanning, setScanning] = useState(false)
+  const [scanResult, setScanResult] = useState<DistillScanResponse | null>(null)
+  // 蒸馏卡列表
+  const [cards, setCards] = useState<readonly DistilledCardWithConfidence[]>([])
+  const [cardsLoading, setCardsLoading] = useState(false)
+  const [detailId, setDetailId] = useState<string | null>(null)
+  const [evidenceId, setEvidenceId] = useState<string | null>(null)
+  const [promotingId, setPromotingId] = useState<string | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  // 单会话蒸馏
+  const [singleSessionId, setSingleSessionId] = useState('')
+  const [distillingSingle, setDistillingSingle] = useState(false)
+
+  const reloadCards = useCallback(() => {
+    setCardsLoading(true)
+    fetchDistilledCards()
+      .then((response) => setCards(response.cards))
+      .catch((error) => reportError(error, '加载蒸馏卡失败'))
+      .finally(() => setCardsLoading(false))
+  }, [])
+
+  // 挂载即拉取蒸馏卡列表（服务端已按 confidence 降序返回）
+  useEffect(() => {
+    reloadCards()
+  }, [reloadCards])
+
+  /** 校验并解析扫描参数，执行批量扫描蒸馏（超时放宽到 5 分钟）。 */
+  const runScan = (): void => {
+    const limitNum = Number.parseInt(scanLimit, 10)
+    const maxNum = Number.parseInt(maxDistill, 10)
+    const signalNum = Number.parseFloat(minSignal)
+    if (!Number.isFinite(limitNum) || limitNum <= 0) {
+      Toast.push('扫描会话数需为正整数', 'warning')
+      return
+    }
+    if (!Number.isFinite(maxNum) || maxNum <= 0) {
+      Toast.push('单批蒸馏上限需为正整数', 'warning')
+      return
+    }
+    if (!Number.isFinite(signalNum) || signalNum < 0 || signalNum > 1) {
+      Toast.push('信号门槛需为 0-1 之间的小数', 'warning')
+      return
+    }
+    setScanning(true)
+    scanDistillExperience(
+      { limit: limitNum, maxDistill: maxNum, minSignal: signalNum },
+      { timeoutMs: DISTILL_SCAN_TIMEOUT_MS },
+    )
+      .then((response) => {
+        setScanResult(response)
+        Toast.push(`扫描完成：候选 ${response.candidates.length} 个，蒸馏 ${response.distilled.length} 个`, 'success')
+        reloadCards()
+      })
+      .catch((error) => reportError(error, '扫描蒸馏失败'))
+      .finally(() => setScanning(false))
+  }
+
+  /** 晋升蒸馏卡为正式执行经验卡（人工确认后调用）。 */
+  const promoteCard = (card: DistilledCardWithConfidence): void => {
+    if (!window.confirm(`确认晋升「${card.title}」为正式经验卡？`)) return
+    setPromotingId(card.id)
+    promoteDistilledCard({ id: card.id })
+      .then(() => {
+        Toast.push('已晋升为正式经验卡', 'success')
+        reloadCards()
+      })
+      .catch((error) => reportError(error, '晋升失败'))
+      .finally(() => setPromotingId(null))
+  }
+
+  /** 删除蒸馏卡（人工确认后调用）。 */
+  const removeCard = (card: DistilledCardWithConfidence): void => {
+    if (!window.confirm(`确认删除蒸馏卡「${card.title}」？`)) return
+    setDeletingId(card.id)
+    deleteDistilledCard(card.id)
+      .then(() => {
+        Toast.push('蒸馏卡已删除', 'success')
+        reloadCards()
+      })
+      .catch((error) => reportError(error, '删除蒸馏卡失败'))
+      .finally(() => setDeletingId(null))
+  }
+
+  /** 对指定会话单独执行蒸馏（结果以 Toast 汇报并刷新列表）。 */
+  const distillSingle = (): void => {
+    const sessionId = singleSessionId.trim()
+    if (!sessionId) {
+      Toast.push('请填写会话 id', 'warning')
+      return
+    }
+    setDistillingSingle(true)
+    distillSessionExperience({ sessionId })
+      .then((outcome) => {
+        const message =
+          outcome.status === 'created'
+            ? '已蒸馏出新经验卡'
+            : outcome.status === 'merged'
+              ? '已合并入已有经验卡'
+              : '该会话未发现可蒸馏信号'
+        Toast.push(message, outcome.status === 'no-signal' ? 'info' : 'success')
+        reloadCards()
+      })
+      .catch((error) => reportError(error, '单会话蒸馏失败'))
+      .finally(() => setDistillingSingle(false))
+  }
+
+  return (
+    <>
+      <section className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h3>扫描并蒸馏</h3>
+        </div>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>扫描会话数（最近 N 个）</span>
+            <Input type="number" value={scanLimit} onChange={(event) => setScanLimit(event.target.value)} />
+          </label>
+          <label className={styles.field}>
+            <span>单批蒸馏上限</span>
+            <Input type="number" value={maxDistill} onChange={(event) => setMaxDistill(event.target.value)} />
+          </label>
+          <label className={styles.field}>
+            <span>信号门槛（0-1）</span>
+            <Input type="number" value={minSignal} onChange={(event) => setMinSignal(event.target.value)} />
+          </label>
+        </div>
+        <div className={styles.rowActions}>
+          <Button size="sm" variant="primary" disabled={scanning} onClick={runScan}>
+            {scanning ? <Spinner label="扫描蒸馏中…" /> : '扫描并蒸馏'}
+          </Button>
+        </div>
+        <p className={styles.hint}>
+          蒸馏管线：信号挖矿（本地零成本）→ 元提示蒸馏 → 语义去重合并 → 证据链回溯；复发度是经验价值的黄金标准，晋升需人工确认。
+        </p>
+
+        {scanResult !== null && (
+          <div className={styles.distillReport}>
+            <div className={styles.distillSummary}>
+              <span>扫描 {scanResult.scanned} 个会话</span>
+              <span>高信号候选 {scanResult.candidates.length} 个</span>
+              <span>成功蒸馏 {scanResult.distilled.length} 个</span>
+              <span>失败 {scanResult.errors.length} 个</span>
+            </div>
+            {scanResult.candidates.length > 0 ? (
+              <>
+                <h4 className={styles.subTitle}>高信号候选（{scanResult.candidates.length}）</h4>
+                <div className={styles.distillCandidateList}>
+                  {scanResult.candidates.map((candidate) => (
+                    <span key={candidate.sessionId} className={styles.distillCandidate}>
+                      <span className={styles.distillCandidateTitle}>{candidate.title}</span>
+                      <Pill className={styles.pillWarning}>{formatPercent(candidate.score)}</Pill>
+                    </span>
+                  ))}
+                </div>
+              </>
+            ) : null}
+            {scanResult.distilled.length > 0 ? (
+              <>
+                <h4 className={styles.subTitle}>蒸馏结果（{scanResult.distilled.length}）</h4>
+                <div className={styles.distillResultList}>
+                  {scanResult.distilled.map((item) => {
+                    const status = DISTILL_STATUS[item.outcome.status]
+                    return (
+                      <div key={item.sessionId} className={styles.distillResultItem}>
+                        <span className={styles.cellCode}>{shortId(item.sessionId)}</span>
+                        <Pill className={status.cls}>{status.label}</Pill>
+                        <span className={styles.distillResultLesson}>
+                          {item.outcome.card ? item.outcome.card.lesson : '（无卡片产物）'}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              </>
+            ) : null}
+            {scanResult.errors.length > 0 ? (
+              <>
+                <h4 className={styles.subTitle}>失败明细（{scanResult.errors.length}）</h4>
+                <div className={styles.distillErrorList}>
+                  {scanResult.errors.map((item) => (
+                    <p key={item.sessionId} className={styles.errorText}>
+                      {shortId(item.sessionId)}：{item.error}
+                    </p>
+                  ))}
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
+      </section>
+
+      <section className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h3>蒸馏经验卡（按置信度降序）</h3>
+          <Button size="sm" variant="secondary" disabled={cardsLoading} onClick={reloadCards}>
+            刷新
+          </Button>
+        </div>
+        {cardsLoading && cards.length === 0 ? (
+          <Spinner label="加载蒸馏卡…" />
+        ) : cards.length === 0 ? (
+          <p className={styles.empty}>暂无蒸馏经验卡，先运行「扫描并蒸馏」。</p>
+        ) : (
+          <div className={styles.cardList}>
+            {cards.map((card) => (
+              <div key={card.id} className={styles.card}>
+                <div className={styles.cardHead}>
+                  <span className={styles.cardTitle}>{card.title}</span>
+                  <div className={styles.rowActions}>
+                    <Pill className={styles.pillInfo}>置信度 {formatPercent(card.confidence)}</Pill>
+                    {card.occurrences >= 2 ? (
+                      <Pill className={styles.pillWarning}>复发 ×{card.occurrences}</Pill>
+                    ) : (
+                      <Pill className={styles.pillInfo}>{card.occurrences} 次</Pill>
+                    )}
+                    {card.promoted ? <Pill className={styles.pillSuccess}>已晋升</Pill> : null}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setDetailId((prev) => (prev === card.id ? null : card.id))}
+                    >
+                      {detailId === card.id ? '收起问题/方案' : '问题/方案'}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setEvidenceId((prev) => (prev === card.id ? null : card.id))}
+                    >
+                      {evidenceId === card.id ? '收起证据链' : `证据链（${card.evidence.length}）`}
+                    </Button>
+                    {!card.promoted ? (
+                      <Button size="sm" variant="primary" disabled={promotingId === card.id} onClick={() => promoteCard(card)}>
+                        {promotingId === card.id ? <Spinner label="晋升中…" /> : '晋升为经验卡'}
+                      </Button>
+                    ) : null}
+                    <Button size="sm" variant="danger" disabled={deletingId === card.id} onClick={() => removeCard(card)}>
+                      {deletingId === card.id ? <Spinner label="删除中…" /> : '删除'}
+                    </Button>
+                  </div>
+                </div>
+                <div className={styles.cardMeta}>
+                  信号分 {card.signalScore.toFixed(2)} · 出现 {card.occurrences} 次 · 首次 {formatTime(card.createdAt)}
+                  · 最近复发 {formatTime(card.lastSeenAt)} · 来源 {card.sourceSessions.length} 个会话（如{' '}
+                  {shortId(card.sessionId)}）
+                </div>
+                <p className={styles.distillLesson}>教训：{card.lesson}</p>
+                {card.tags.length > 0 ? (
+                  <div className={styles.distillTags}>
+                    {card.tags.map((tag) => (
+                      <Pill key={tag} className={styles.pillInfo}>
+                        {tag}
+                      </Pill>
+                    ))}
+                  </div>
+                ) : null}
+                {detailId === card.id ? (
+                  <div className={styles.cardBody}>
+                    <div className={styles.distillPS}>
+                      <span className={styles.distillPSLabel}>问题</span>
+                      <span>{card.problem || '-'}</span>
+                    </div>
+                    <div className={styles.distillPS}>
+                      <span className={styles.distillPSLabel}>方案</span>
+                      <span>{card.solution || '-'}</span>
+                    </div>
+                  </div>
+                ) : null}
+                {evidenceId === card.id ? (
+                  <div className={styles.distillEvidence}>
+                    {card.evidence.length === 0 ? (
+                      <p className={styles.empty}>暂无证据链。</p>
+                    ) : (
+                      card.evidence.map((entry) => (
+                        <div key={`${card.id}-${entry.seq}`} className={styles.distillEvidenceItem}>
+                          <span className={styles.distillEvidenceHead}>
+                            <span className={styles.distillEvidenceSeq}>#{entry.seq}</span>
+                            <Pill className={entry.kind === 'error' ? styles.pillDanger : styles.pillSuccess}>
+                              {entry.kind === 'error' ? '错误' : '修复'}
+                            </Pill>
+                          </span>
+                          <pre className={styles.distillEvidenceExcerpt}>{entry.excerpt}</pre>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className={styles.section}>
+        <div className={styles.sectionHeader}>
+          <h3>单会话蒸馏</h3>
+        </div>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>会话 id（本视图无会话列表，手动粘贴）</span>
+            <Input
+              value={singleSessionId}
+              placeholder="粘贴会话 id"
+              onChange={(event) => setSingleSessionId(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') distillSingle()
+              }}
+            />
+          </label>
+          <div className={styles.field}>
+            <Button size="sm" variant="secondary" disabled={distillingSingle} onClick={distillSingle}>
+              {distillingSingle ? <Spinner label="蒸馏中…" /> : '蒸馏此会话'}
+            </Button>
+          </div>
+        </div>
+      </section>
     </>
   )
 }

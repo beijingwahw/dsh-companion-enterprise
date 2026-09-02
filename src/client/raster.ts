@@ -361,10 +361,10 @@ function pickTileFilter(
   return PNG_FILTERS[best]!
 }
 
-/** CompressionStream 的结构化视图（规避各端 DOM 类型声明差异）。 */
+/** CompressionStream 的结构化视图（对齐 lib.dom 的 BufferSource 元素类型）。 */
 interface DeflateStreamParts {
-  readonly writable: WritableStream<Uint8Array | ArrayBuffer>
-  readonly readable: ReadableStream<Uint8Array | ArrayBuffer>
+  readonly writable: WritableStream<BufferSource>
+  readonly readable: ReadableStream<BufferSource>
 }
 
 /**
@@ -372,7 +372,7 @@ interface DeflateStreamParts {
  * finish 时组装完整 PNG Blob。峰值内存 ≈ 单片原始像素 + 压缩输出。
  */
 class StreamingPngEncoder {
-  private readonly writer: WritableStreamDefaultWriter<Uint8Array | ArrayBuffer>
+  private readonly writer: WritableStreamDefaultWriter<BufferSource>
   private readonly outputChunks: Uint8Array[] = []
   private readonly pump: Promise<void>
   private pumpError: unknown
@@ -384,7 +384,9 @@ class StreamingPngEncoder {
     private readonly heightPx: number,
   ) {
     // 'deflate' 恰产出 zlib(RFC1950) 流——正是 PNG IDAT 的规范格式。
-    const streams = new CompressionStream('deflate') as unknown as DeflateStreamParts
+    // CompressionStream 的标准类型在不同 lib.dom 版本间泛型形状漂移，
+    // 此处经 DeflateStreamParts 结构化视图统一（成员结构跨端一致）。
+    const streams: DeflateStreamParts = new CompressionStream('deflate')
     this.writer = streams.writable.getWriter()
     const reader = streams.readable.getReader()
     // 并行泵：边写入边收集压缩输出（TransformStream 背压自动节流写入侧）。
@@ -393,7 +395,14 @@ class StreamingPngEncoder {
         const { done, value } = await reader.read()
         if (done) break
         if (value !== undefined) {
-          this.outputChunks.push(value instanceof Uint8Array ? value : new Uint8Array(value))
+          // BufferSource 三态收敛为 Uint8Array（视图分支保留字节偏移）。
+          this.outputChunks.push(
+            value instanceof Uint8Array
+              ? value
+              : value instanceof ArrayBuffer
+                ? new Uint8Array(value)
+                : new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+          )
         }
       }
     })().catch((error: unknown) => {

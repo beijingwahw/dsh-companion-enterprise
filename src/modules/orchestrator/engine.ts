@@ -2,17 +2,23 @@
  * 模块 H：断点续跑与任务编排 —— 执行引擎。
  *
  * - PipelineEngine：按依赖关系（串行/并行/条件分支）执行流水线步骤，
- *   每步完成即持久化中间结果（H2）；失败步骤按配置自动重试；
+ *   每步完成即持久化中间结果（H2）；失败步骤按错误类别差异化自动重试
+ *   （non-retryable 立即放弃 / rate-limit 长退避 / 瞬态短退避，
+ *   指数退避 + 全抖动）；断路器熔断期间自动扣住该模型的步骤，
+ *   冷却后半开探针自愈；主模型失败可降级 fallbackModel 补跑（自愈执行）；
+ *   跨层调度：上游完成即刻释放下游（不等整层），信号量限制并发防配额风暴；
  *   超时自动暂停并通知；resume 从最后成功步骤继续（已完成步骤直接复用输出）；
- * - QueueWorker：批量任务队列（H3），按优先级 + 截止时间排序逐个执行；
+ * - QueueWorker：批量任务队列（H3），按优先级 + 截止时间排序逐个执行，
+ *   断路器熔断的模型自动让位给其他模型的排队任务；
  * - CronTicker：分钟级扫描定时任务（H4），峰谷感知（offPeakOnly 时
- *   仅空闲时段触发），执行结果归档。
+ *   仅空闲时段触发），熔断模型顺延到下个扫描周期，执行结果归档。
  *
  * 所有定时器随 Cordis fiber 卸载清理；执行中的调用经 AbortController 可取消。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { isPeakTime } from '../../core/time.js'
 import { nextCronFire, parseCron } from './cron.js'
+import { backoffDelay, CircuitBreaker, classifyError, stepModelPeek } from './selfheal.js'
 import type { PipelineRunStore, QueueTaskStore, ScheduledJobStore, ScheduledRunStore } from './store.js'
 import type {
   Pipeline,
@@ -98,6 +104,7 @@ export function pipelineToYaml(pipeline: Pipeline): string {
       lines.push(`      maxRetries: ${step.maxRetries}`)
       lines.push(`      intervalMs: ${step.retryIntervalMs}`)
     }
+    if (step.fallbackModel) lines.push(`    fallbackModel: ${step.fallbackModel}`)
     if (step.dependsOn.length > 0) {
       lines.push(`    dependsOn: [${step.dependsOn.join(', ')}]`)
     }
@@ -105,12 +112,20 @@ export function pipelineToYaml(pipeline: Pipeline): string {
   return lines.join('\n')
 }
 
+/** 同一执行内并行步骤上限（信号量，防配额风暴）。 */
+const MAX_PARALLEL_STEPS = 4
+
+/** 全部剩余步骤被断路器扣住时的最长等待：超过后失败收场（可断点恢复）。 */
+const MAX_CIRCUIT_WAIT_MS = 10 * 60_000
+
 /** 流水线执行引擎。 */
 export class PipelineEngine {
   /** runId → 中止控制器。 */
   private readonly aborts = new Map<string, AbortController>()
   /** runId → 暂停请求标记。 */
   private readonly pauseRequests = new Set<string>()
+  /** runId → 首次因断路器完全停滞的时间（超时上限用）。 */
+  private readonly blockedSince = new Map<string, number>()
   private disposed = false
 
   constructor(
@@ -118,6 +133,8 @@ export class PipelineEngine {
     private readonly runs: PipelineRunStore,
     private readonly call: EngineCall,
     private readonly defaultTimeoutMs: number,
+    /** 模型断路器（与队列/定时调度共享同一实例）。 */
+    readonly breaker: CircuitBreaker = new CircuitBreaker(),
   ) {}
 
   /** 释放：中止全部执行中的流水线。 */
@@ -152,6 +169,7 @@ export class PipelineEngine {
             endedAt: 0,
             latencyMs: 0,
             tokens: 0,
+            usedFallback: false,
           } satisfies StepRun,
         ]),
       ),
@@ -181,6 +199,7 @@ export class PipelineEngine {
       } finally {
         this.aborts.delete(run.id)
         this.pauseRequests.delete(run.id)
+        this.blockedSince.delete(run.id)
         await this.runs.put(run).catch(() => undefined)
         this.notifyFinished(pipeline, run)
       }
@@ -216,8 +235,17 @@ export class PipelineEngine {
     return true
   }
 
-  /** 主循环：按依赖就绪状态调度步骤（就绪步骤并行执行）。 */
+  /**
+   * 主循环：跨层数据流调度。
+   * 就绪步骤（依赖完成且模型未被熔断）立刻启动（不等待同层其他步骤），
+   * 信号量限制并发；被断路器扣住的步骤等待冷却后半开探针自愈。
+   */
   private async runLoop(pipeline: Pipeline, run: PipelineRun, signal: AbortSignal): Promise<void> {
+    /** 运行中的 detached 步骤数（信号量计数）。 */
+    let inflight = 0
+    /** 已启动过的步骤（防“启动→状态翻转”异步窗口内重复启动）。 */
+    const launched = new Set<string>()
+
     for (;;) {
       if (signal.aborted) {
         run.status = 'cancelled'
@@ -233,21 +261,33 @@ export class PipelineEngine {
         return
       }
 
-      // 找出就绪步骤：依赖全部 done/skipped 且自身 pending。
+      // 统计步骤状态并挑选本轮可启动的步骤。
       const ready: PipelineStep[] = []
-      let hasRunning = false
+      let inflightSteps = false
       let hasFailure = false
+      let pendingCount = 0
+      let blockedCount = 0
       for (const step of pipeline.steps) {
         const record = run.steps[step.id]
         if (!record) continue
-        if (record.status === 'running') hasRunning = true
+        if (record.status === 'running') inflightSteps = true
         if (record.status === 'failed') hasFailure = true
         if (record.status !== 'pending') continue
+        if (launched.has(step.id)) continue
+        pendingCount += 1
         const depsReady = step.dependsOn.every((dep) => {
           const depRecord = run.steps[dep]
           return depRecord && (depRecord.status === 'done' || depRecord.status === 'skipped')
         })
-        if (depsReady) ready.push(step)
+        if (!depsReady) continue
+        // 断路器：主模型与降级模型都被熔断 → 扣住等待冷却。
+        if (!stepModelPeek(this.breaker, step)) {
+          blockedCount += 1
+          continue
+        }
+        // 信号量：并发已满 → 剩余就绪步骤下轮再取。
+        if (inflight + ready.length >= MAX_PARALLEL_STEPS) continue
+        ready.push(step)
       }
 
       if (hasFailure) {
@@ -256,24 +296,51 @@ export class PipelineEngine {
         run.message = '存在失败步骤（可修复后从断点恢复）'
         return
       }
-      if (ready.length === 0 && !hasRunning) {
-        // 无就绪步骤也无运行中步骤：全部完成。
+      if (pendingCount === 0 && !inflightSteps && inflight === 0) {
+        // 无待办也无运行中步骤：全部完成。
         run.status = 'done'
         run.endedAt = Date.now()
         return
       }
-      if (ready.length === 0) {
-        // 等待运行中的步骤完成。
-        await sleep(200)
-        continue
+
+      // 启动就绪步骤（detached：完成即刻释放下游，不阻塞本轮循环）。
+      for (const step of ready) {
+        launched.add(step.id)
+        inflight += 1
+        void this.runStep(pipeline, run, step, signal)
+          .catch(() => undefined)
+          .finally(() => {
+            inflight -= 1
+          })
       }
 
-      // 并行执行就绪步骤（各自独立持久化中间结果）。
-      await Promise.all(ready.map((step) => this.runStep(pipeline, run, step, signal)))
+      // 全部剩余步骤被断路器扣住：等待冷却（半开探针），超上限则失败收场。
+      if (blockedCount > 0 && !inflightSteps && inflight === 0 && ready.length === 0) {
+        if (!this.blockedSince.has(run.id)) this.blockedSince.set(run.id, Date.now())
+        const waited = Date.now() - (this.blockedSince.get(run.id) ?? Date.now())
+        if (waited > MAX_CIRCUIT_WAIT_MS) {
+          run.status = 'failed'
+          run.endedAt = Date.now()
+          run.message = `模型断路器持续熔断超过 ${Math.round(MAX_CIRCUIT_WAIT_MS / 60_000)} 分钟，已停止等待（可从断点恢复）`
+          return
+        }
+      } else {
+        this.blockedSince.delete(run.id)
+      }
+
+      await sleep(200)
     }
   }
 
-  /** 执行单个步骤（含条件分支、超时、重试）。 */
+  /**
+   * 执行单个步骤（含条件分支、超时、差异化重试、自愈降级）。
+   *
+   * 重试策略按错误类别区分：
+   * - non-retryable（鉴权/预算/参数/安全策略）：立即放弃主模型，不烧配额；
+   * - rate-limit：长退避（指数退避 + 全抖动，防重试风暴）；
+   * - timeout / transient：标准退避。
+   * 主模型耗尽后若配置了 fallbackModel 且其未被熔断，自动降级补跑一次。
+   */
   private async runStep(
     pipeline: Pipeline,
     run: PipelineRun,
@@ -305,6 +372,18 @@ export class PipelineEngine {
       ? `${step.prompt}\n\n${input}`.trim()
       : input
 
+    // 断路器准入：主模型被熔断时若降级模型可用则直接走降级；均被熔断则
+    // 回到 pending 等待冷却（调度循环会持续重试）。
+    const primaryAdmitted = this.breaker.admit(step.model)
+    const fallbackModel =
+      step.fallbackModel && step.fallbackModel !== step.model ? step.fallbackModel : ''
+    if (!primaryAdmitted && !fallbackModel) {
+      record.status = 'pending'
+      record.startedAt = 0
+      await this.runs.put(run)
+      return
+    }
+
     record.status = 'running'
     record.startedAt = Date.now()
     await this.runs.put(run)
@@ -312,43 +391,94 @@ export class PipelineEngine {
     const timeoutMs = step.timeoutMs > 0 ? step.timeoutMs : this.defaultTimeoutMs
     const maxAttempts = Math.max(1, step.maxRetries + 1)
     let lastError = ''
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      if (signal.aborted) {
-        record.status = 'pending'
-        record.startedAt = 0
-        await this.runs.put(run)
-        return
+
+    // ---- 主模型尝试（差异化重试） ----
+    if (primaryAdmitted) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (signal.aborted || run.status !== 'running') {
+          record.status = 'pending'
+          record.startedAt = 0
+          await this.runs.put(run)
+          return
+        }
+        record.attempts = attempt
+        try {
+          const result = await withTimeout(
+            this.call({ prompt, model: step.model, timeoutMs, source: 'orchestrator' }),
+            timeoutMs,
+            `步骤「${step.name}」执行超时（${Math.round(timeoutMs / 1000)}s）`,
+          )
+          this.breaker.recordSuccess(step.model)
+          record.status = 'done'
+          record.output = result.content
+          record.error = ''
+          record.endedAt = Date.now()
+          record.latencyMs = record.endedAt - record.startedAt
+          record.tokens = result.tokens
+          await this.runs.put(run)
+          return
+        } catch (error) {
+          lastError = error instanceof Error ? error.message : String(error)
+          const errorClass = classifyError(lastError)
+          this.breaker.recordFailure(step.model)
+          if (errorClass === 'non-retryable') break
+          // 限流类退避基数放大（重试风暴治理），其余用步骤配置的间隔。
+          const baseMs =
+            errorClass === 'rate-limit'
+              ? Math.max(step.retryIntervalMs * 2, 10_000)
+              : step.retryIntervalMs
+          if (attempt < maxAttempts) await sleep(backoffDelay(attempt, baseMs, 30_000))
+        }
       }
-      record.attempts = attempt
+    }
+
+    // ---- 自愈降级：fallback 模型补跑一次 ----
+    if (fallbackModel && this.breaker.admit(fallbackModel)) {
+      record.usedFallback = true
+      record.attempts += 1
       try {
         const result = await withTimeout(
-          this.call({ prompt, model: step.model, timeoutMs, source: 'orchestrator' }),
+          this.call({ prompt, model: fallbackModel, timeoutMs, source: 'orchestrator' }),
           timeoutMs,
-          `步骤「${step.name}」执行超时（${Math.round(timeoutMs / 1000)}s）`,
+          `步骤「${step.name}」降级模型执行超时（${Math.round(timeoutMs / 1000)}s）`,
         )
+        this.breaker.recordSuccess(fallbackModel)
         record.status = 'done'
         record.output = result.content
-        record.error = ''
+        record.error = primaryAdmitted
+          ? `主模型 ${step.model} 失败（${lastError}），已由降级模型 ${fallbackModel} 完成`
+          : `主模型 ${step.model} 被熔断，已由降级模型 ${fallbackModel} 完成`
         record.endedAt = Date.now()
         record.latencyMs = record.endedAt - record.startedAt
         record.tokens = result.tokens
         await this.runs.put(run)
+        this.ctx.companion.notice(
+          'info',
+          `流水线「${pipeline.name}」步骤「${step.name}」已自愈降级至 ${fallbackModel}`,
+        )
         return
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        // 最后一次尝试失败前等待重试间隔。
-        if (attempt < maxAttempts && step.retryIntervalMs > 0) {
-          await sleep(step.retryIntervalMs)
-        }
+        const fallbackError = error instanceof Error ? error.message : String(error)
+        this.breaker.recordFailure(fallbackModel)
+        lastError = `主模型 ${step.model}：${lastError}；降级模型 ${fallbackModel}：${fallbackError}`
       }
+    } else if (fallbackModel && lastError === '') {
+      // 主模型被熔断、降级模型也暂不可用 → 等待下一轮。
+      record.status = 'pending'
+      record.startedAt = 0
+      record.usedFallback = false
+      record.attempts = 0
+      await this.runs.put(run)
+      return
     }
+
     record.status = 'failed'
-    record.error = lastError
+    record.error = lastError || `主模型 ${step.model} 被断路器熔断且无降级模型`
     record.endedAt = Date.now()
     record.latencyMs = record.endedAt - record.startedAt
     await this.runs.put(run)
     // 超时自动暂停并通知（H2 需求）。
-    if (/超时/.test(lastError)) {
+    if (/超时|timeout/i.test(lastError)) {
       this.requestPause(run.id)
       this.ctx.companion.notice('warning', `流水线「${pipeline.name}」步骤「${step.name}」超时，已自动暂停`)
     }
@@ -368,6 +498,8 @@ export class QueueWorker {
     private readonly tasks: QueueTaskStore,
     private readonly call: EngineCall,
     private readonly defaultTimeoutMs: number,
+    /** 模型断路器（与流水线/定时调度共享同一实例）。 */
+    private readonly breaker: CircuitBreaker = new CircuitBreaker(),
   ) {}
 
   /** 启动周期扫描（每 3 秒检查一次待执行任务）。 */
@@ -398,13 +530,18 @@ export class QueueWorker {
     return false
   }
 
-  /** 取出下一个待执行任务：优先级 high>medium>low，同级按截止时间早者优先，再按创建时间。 */
+  /**
+   * 取出下一个待执行任务：优先级 high>medium>low，同级按截止时间早者优先，再按创建时间。
+   * 断路器熔断的模型自动跳过（其任务让位给其他模型的排队任务，冷却后自动回来）。
+   */
   private nextQueued(): QueueTask | undefined {
     const priorityRank: Record<string, number> = { high: 0, medium: 1, low: 2 }
     // 单次线性扫描选最优（O(n)），避免每次出队都对全队列排序（O(n log n)）。
     let best: QueueTask | undefined
     for (const task of this.tasks.list()) {
       if (task.status !== 'queued') continue
+      // 断路器纯查询（peek）：熔断中的模型本周期跳过。
+      if (!this.breaker.peek(task.model)) continue
       if (!best) {
         best = task
         continue
@@ -446,8 +583,14 @@ export class QueueWorker {
     }
   }
 
-  /** 执行单个队列任务（含失败策略）。 */
+  /** 执行单个队列任务（含断路器准入、失败策略）。 */
   private async executeTask(task: QueueTask): Promise<void> {
+    // 断路器准入（带副作用）：抢不到名额说明被探针/熔断拦下，回到队尾等下轮。
+    if (!this.breaker.admit(task.model)) {
+      task.status = 'queued'
+      await this.tasks.put(task)
+      return
+    }
     task.status = 'running'
     await this.tasks.put(task)
     const controller = new AbortController()
@@ -459,6 +602,7 @@ export class QueueWorker {
         timeoutMs: this.defaultTimeoutMs,
         source: 'orchestrator-queue',
       })
+      this.breaker.recordSuccess(task.model)
       task.status = 'done'
       task.output = result.content
       task.error = ''
@@ -469,6 +613,7 @@ export class QueueWorker {
       this.aborts.delete(task.id)
       task.attempts += 1
       const message = error instanceof Error ? error.message : String(error)
+      this.breaker.recordFailure(task.model)
       if (controller.signal.aborted) {
         task.status = 'cancelled'
         task.error = '已取消'
@@ -476,8 +621,9 @@ export class QueueWorker {
         await this.tasks.put(task)
         return
       }
-      if (task.failurePolicy === 'retry' && task.attempts < 3) {
-        // 重试策略：回到队列（最多 3 次尝试）。
+      // 不可重试错误（鉴权/预算/参数）：不再回到队列，直接失败收场。
+      if (task.failurePolicy === 'retry' && task.attempts < 3 && classifyError(message) !== 'non-retryable') {
+        // 重试策略：回到队列（最多 3 次尝试；断路器熔断时下轮自动跳过）。
         task.status = 'queued'
         task.error = message
         await this.tasks.put(task)
@@ -509,6 +655,8 @@ export class CronTicker {
     private readonly jobRuns: ScheduledRunStore,
     private readonly call: EngineCall,
     private readonly defaultTimeoutMs: number,
+    /** 模型断路器（与流水线/队列共享同一实例）。 */
+    private readonly breaker: CircuitBreaker = new CircuitBreaker(),
   ) {}
 
   /** 启动分钟级扫描；同时重算全部任务的下次触发时刻。 */
@@ -550,6 +698,8 @@ export class CronTicker {
       if (!job.enabled || job.nextRunAt <= 0 || now < job.nextRunAt) continue
       // 峰谷感知：仅空闲时段执行（高峰时刻顺延到下一分钟重试）。
       if (job.offPeakOnly && isPeakTime(now)) continue
+      // 断路器：模型熔断期间顺延（不重排 nextRunAt，下个周期自动重试）。
+      if (!this.breaker.peek(job.model)) continue
       // 先重排下次触发，再执行本次（执行耗时不影响调度）。
       this.reschedule(job)
       job.lastRunAt = now
@@ -564,6 +714,8 @@ export class CronTicker {
     let ok = false
     let output = ''
     let error = ''
+    // 断路器准入：抢不到探针名额则本次跳过（下个触发周期再来）。
+    if (!this.breaker.admit(job.model)) return
     try {
       const result = await this.call({
         prompt: job.prompt,
@@ -571,10 +723,12 @@ export class CronTicker {
         timeoutMs: this.defaultTimeoutMs,
         source: 'orchestrator-cron',
       })
+      this.breaker.recordSuccess(job.model)
       ok = true
       output = result.content
     } catch (err) {
       error = err instanceof Error ? err.message : String(err)
+      this.breaker.recordFailure(job.model)
       this.ctx.companion.notice('warning', `定时任务「${job.name}」执行失败：${error}`)
     }
     await this.jobRuns

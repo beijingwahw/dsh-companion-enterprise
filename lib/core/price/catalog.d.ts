@@ -25,8 +25,12 @@ export interface VendorInfo {
     /** 是否阶梯计价（目录中为最低档价格）。 */
     tiered?: boolean;
 }
-/** 厂商元信息。 */
-export declare const VENDORS: Record<string, VendorInfo>;
+/** 全部厂商 id（与 VENDORS 的键一一对应）。 */
+export declare const VENDOR_IDS: readonly ['deepseek', 'zhipu', 'moonshot', 'qwen', 'doubao', 'minimax', 'ernie'];
+/** 厂商 id 的精确类型：以字面量联合取代裸 string，未知厂商无法通过类型检查。 */
+export type VendorId = (typeof VENDOR_IDS)[number];
+/** 厂商元信息：键类型精确到 VendorId，"deepseek 必然存在"由类型系统背书。 */
+export declare const VENDORS: Record<VendorId, VendorInfo>;
 /**
  * 内置价格目录（官方刊例价快照，元/百万 tokens）。
  * inputCacheHit 为缓存命中输入价；未公布缓存价的按输入价约 20% 估算并标注。
@@ -34,5 +38,11 @@ export declare const VENDORS: Record<string, VendorInfo>;
 export declare const CATALOG_TABLE: PriceTable;
 /** 识别模型所属厂商；未知返回 undefined。 */
 export declare function vendorOf(model: string): string | undefined;
+/**
+ * 按任意字符串安全查找厂商元信息（未知 id 返回 undefined）。
+ * hasOwn 收窄后断言到 VendorId 是合法的类型收窄（非危险断言）：
+ * 调用方拿到的 undefined 即"未知厂商"信号，无需非空断言。
+ */
+export declare function vendorInfoOf(vendorId: string): VendorInfo | undefined;
 /** 某厂商的全部模型 id 前缀（用于在定价页表格中识别模型单元格）。 */
 export declare function prefixesOf(vendorId: string): string[];

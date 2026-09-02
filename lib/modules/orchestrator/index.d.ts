@@ -10,7 +10,13 @@
  * H3 批量队列：GET/POST /orchestrator/queue、POST /orchestrator/queue/cancel、
  *    /pause、/resume、DELETE /orchestrator/queue、GET /orchestrator/queue/counts；
  * H4 定时调度：GET/POST /orchestrator/jobs、DELETE /orchestrator/jobs、
- *    GET /orchestrator/jobs/runs、POST /orchestrator/parse-schedule（自然语言 → Cron）。
+ *    GET /orchestrator/jobs/runs、POST /orchestrator/parse-schedule（自然语言 → Cron）；
+ * 自愈执行：GET /orchestrator/circuits（模型断路器全景：closed/open/half-open）；
+ * DAG 规划：POST /orchestrator/dag（拓扑分层 + 关键路径 + 优化建议）；
+ * 蒙特卡洛模拟：POST /orchestrator/monte（PERT 三点估算 + P50/P90 工期置信区间
+ *    + 步骤关键性指数，iterations/parallelism 可选）；
+ * 关键路径分析：POST /orchestrator/cpm（CPM ES/EF/LS/LF/松弛 + 并发峰值画像
+ *    + 并行化收益 + 瓶颈步骤，durationOverrides 可选）。
  *
  * 命令 `tasks`：查看队列与定时任务概览。
  */

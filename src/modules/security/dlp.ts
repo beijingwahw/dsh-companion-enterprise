@@ -118,6 +118,41 @@ export function scanText(text: string, rules: readonly DlpRule[]): DlpFinding[] 
   return findings
 }
 
+/** 原始命中（污点追踪内部使用：需要明文值做跨事件追迹）。 */
+export interface RawMatch {
+  readonly ruleId: string
+  readonly ruleName: string
+  /** 命中的原始文本（不得直接出现在任何响应或日志里）。 */
+  readonly value: string
+}
+
+/**
+ * 扫描文本，返回原始命中值（供污点追踪跨事件匹配）。
+ * 与 scanText 共用同一套规则编译缓存；单规则命中数同样设上限。
+ * 安全契约：调用方（taint.ts）只回传掩码形态，本函数返回值不外发。
+ */
+export function findRawMatches(text: string, rules: readonly DlpRule[]): RawMatch[] {
+  const matches: RawMatch[] = []
+  for (const rule of rules) {
+    if (!rule.enabled) continue
+    let regex: RegExp
+    try {
+      regex = compileRule(rule)
+    } catch {
+      continue
+    }
+    let count = 0
+    for (const match of text.matchAll(regex)) {
+      count += 1
+      if (match[0]) {
+        matches.push({ ruleId: rule.id, ruleName: rule.name, value: match[0] })
+      }
+      if (count >= MAX_FINDINGS_PER_RULE) break
+    }
+  }
+  return matches
+}
+
 /** 脱敏：将命中片段替换为 [已脱敏:规则名]。 */
 export function redactText(text: string, rules: readonly DlpRule[]): string {
   let result = text

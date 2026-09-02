@@ -37,12 +37,13 @@ export interface ExportDialogProps {
   readonly onClose: () => void
 }
 
-/** 格式选项（value 为 API 契约的 'markdown' | 'pdf' | 'json' | 'png'）。 */
+/** 格式选项（value 为 API 契约的 'markdown' | 'pdf' | 'json' | 'png' | 'html'）。 */
 const FORMAT_OPTIONS: ReadonlyArray<{ readonly value: ExportFormat; readonly label: string }> = [
   { value: 'markdown', label: 'Markdown（.md）' },
   { value: 'pdf', label: 'PDF（.pdf）' },
   { value: 'json', label: 'JSON（.json）' },
   { value: 'png', label: 'PNG 长图（.png）' },
+  { value: 'html', label: '交互式 HTML 档案（.html，支持搜索 / 角色筛选 / 折叠）' },
 ]
 
 /** 毫秒时间戳 → 本地可读日期时间。 */
